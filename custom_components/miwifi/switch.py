@@ -19,6 +19,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import (
     ATTR_BINARY_SENSOR_DUAL_BAND,
     ATTR_STATE,
+    ATTR_SWITCH_QOS,
+    ATTR_SWITCH_QOS_NAME,
     ATTR_SWITCH_WIFI_2_4,
     ATTR_SWITCH_WIFI_2_4_NAME,
     ATTR_SWITCH_WIFI_5_0,
@@ -117,6 +119,20 @@ async def async_setup_entry(
             MiWifiSwitch(
                 f"{config_entry.entry_id}-{description.key}",
                 description,
+                updater,
+            )
+        )
+
+    if ATTR_SWITCH_QOS in updater.data:
+        entities.append(
+            MiWifiQosSwitch(
+                f"{config_entry.entry_id}-{ATTR_SWITCH_QOS}",
+                SwitchEntityDescription(
+                    key=ATTR_SWITCH_QOS,
+                    name=ATTR_SWITCH_QOS_NAME,
+                    icon="mdi:speedometer",
+                    entity_category=EntityCategory.CONFIG,
+                ),
                 updater,
             )
         )
@@ -339,3 +355,66 @@ class MiWifiSwitch(MiWifiEntity, SwitchEntity):
         )
         if icon_name in ICONS:
             self._attr_icon = ICONS[icon_name]
+
+
+class MiWifiQosSwitch(MiWifiEntity, SwitchEntity):
+    """MiWifi QoS on/off switch."""
+
+    def __init__(
+        self,
+        unique_id: str,
+        description: SwitchEntityDescription,
+        updater: LuciUpdater,
+    ) -> None:
+        """Initialize QoS switch."""
+
+        MiWifiEntity.__init__(self, unique_id, description, updater, ENTITY_ID_FORMAT)
+
+        self._attr_is_on = bool(updater.data.get(description.key, 0))
+        self._attr_available = (
+            updater.data.get(ATTR_STATE, False)
+            and description.key in updater.data
+        )
+
+    def _handle_coordinator_update(self) -> None:
+        """Update state."""
+
+        is_on = bool(self._updater.data.get(self.entity_description.key, 0))
+        is_available = (
+            self._updater.data.get(ATTR_STATE, False)
+            and self.entity_description.key in self._updater.data
+        )
+
+        if self._attr_is_on == is_on and self._attr_available == is_available:
+            return
+
+        self._attr_is_on = is_on
+        self._attr_available = is_available
+        self.async_write_ha_state()
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Turn on QoS with Optimistic UI."""
+        self._attr_is_on = True
+        self.async_write_ha_state()
+
+        try:
+            await self._updater.luci.set_qos_switch(1)
+            self._updater.data[self.entity_description.key] = 1
+        except LuciError as _e:
+            _LOGGER.debug("QoS switch error: %r", _e)
+            self._attr_is_on = False
+            self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn off QoS with Optimistic UI."""
+
+        self._attr_is_on = False
+        self.async_write_ha_state()
+
+        try:
+            await self._updater.luci.set_qos_switch(0)
+            self._updater.data[self.entity_description.key] = 0
+        except LuciError as _e:
+            _LOGGER.debug("QoS switch error: %r", _e)
+            self._attr_is_on = True
+            self.async_write_ha_state()

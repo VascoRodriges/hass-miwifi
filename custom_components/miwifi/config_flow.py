@@ -7,6 +7,7 @@ import contextlib
 import logging
 
 import homeassistant.helpers.config_validation as cv
+import homeassistant.components.persistent_notification as pn
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.components import dhcp, ssdp
@@ -23,6 +24,7 @@ from httpx import codes
 
 from .const import (
     CONF_ACTIVITY_DAYS,
+    CONF_CLEANUP_STALE_CLIENTS,
     CONF_ENCRYPTION_ALGORITHM,
     CONF_IS_FORCE_LOAD,
     CONF_IS_TRACK_DEVICES,
@@ -266,6 +268,8 @@ class MiWifiOptionsFlow(config_entries.OptionsFlow):
         errors: dict[str, str] = {}
 
         if user_input is not None:
+            cleanup_stale_clients = bool(user_input.get(CONF_CLEANUP_STALE_CLIENTS, False))
+
             code: codes = await async_verify_access(
                 self.hass,
                 user_input[CONF_IP_ADDRESS],
@@ -277,6 +281,28 @@ class MiWifiOptionsFlow(config_entries.OptionsFlow):
             _LOGGER.debug("Verify access code: %s", code)
 
             if codes.is_success(code):
+                if cleanup_stale_clients:
+                    with contextlib.suppress(ValueError):
+                        updater: LuciUpdater = async_get_updater(
+                            self.hass, self._config_entry.entry_id
+                        )
+                        result = await updater.async_cleanup_stale_clients(
+                            user_input.get(CONF_ACTIVITY_DAYS)
+                        )
+                        pn.async_create(
+                            self.hass,
+                            (
+                                "Removed stale MiWiFi clients: "
+                                f"clients={result['removed_clients']}, "
+                                f"devices={result['removed_devices']}, "
+                                f"entities={result['removed_entities']}, "
+                                f"days={result['days']}"
+                            ),
+                            "MiWifi: cleanup stale clients",
+                        )
+
+                user_input = dict(user_input)
+                user_input.pop(CONF_CLEANUP_STALE_CLIENTS, None)
                 await self.async_update_unique_id(user_input[CONF_IP_ADDRESS])
 
                 return self.async_create_entry(
@@ -372,6 +398,10 @@ class MiWifiOptionsFlow(config_entries.OptionsFlow):
                     self._config_entry, CONF_TIMEOUT, DEFAULT_TIMEOUT
                 ),
             ): vol.All(vol.Coerce(int), vol.Range(min=10)),
+            vol.Optional(
+                CONF_CLEANUP_STALE_CLIENTS,
+                default=False,
+            ): cv.boolean,
         }
 
         with contextlib.suppress(ValueError):

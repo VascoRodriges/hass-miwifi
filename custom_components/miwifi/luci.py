@@ -28,6 +28,7 @@ from .const import (
 )
 from .enum import EncryptionAlgorithm
 from .exceptions import LuciConnectionError, LuciError, LuciRequestError
+from .api_map import MIWIFI_API_MAP
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -74,6 +75,55 @@ class LuciClient:
         self._url = CLIENT_URL.format(ip=ip)
 
         self.diagnostics: dict[str, Any] = {}
+
+    async def _execute_api_action(self, action_name: str, **kwargs: Any) -> dict:
+        """Universal API action executor based on the manifest."""
+        
+        schema = MIWIFI_API_MAP.get(action_name)
+        if not schema:
+            raise ValueError(f"Action '{action_name}' not found in API_MAP")
+
+        endpoint = schema["endpoint"]
+        method = schema["method"]
+        static_params = schema.get("static_params", {})
+        payload_map = schema.get("payload_map", {})
+        use_stok = schema.get("use_stok", True)
+        errors = schema.get("errors")
+        passthrough = schema.get("passthrough", False)
+        json_list_payload = schema.get("json_list_payload", False)
+
+        if passthrough:
+            payload = {k: v for k, v in kwargs.items() if v is not None}
+        else:
+            payload = {}
+            for internal_key, mapping in payload_map.items():
+                if internal_key not in kwargs:
+                    continue
+                value = kwargs[internal_key]
+                if isinstance(mapping, (list, tuple)):
+                    router_key, fmt = mapping
+                    payload[router_key] = fmt.format(value)
+                else:
+                    payload[mapping] = str(value)
+
+        if json_list_payload:
+            payload = {"data": json.dumps([payload])}
+
+        if method == "POST":
+            if static_params:
+                payload.update(static_params)
+            return await self.post(
+                endpoint, payload or None, use_stok=use_stok, errors=errors
+            )
+
+        query_params = {}
+        if static_params:
+            query_params.update(static_params)
+        if payload:
+            query_params.update(payload)
+        return await self.get(
+            endpoint, query_params or None, use_stok=use_stok, errors=errors
+        )
 
     async def login(self) -> dict:
         """Login method
@@ -194,13 +244,60 @@ class LuciClient:
 
         return _data
 
+    async def post(
+        self,
+        path: str,
+        form_data: dict | None = None,
+        use_stok: bool = True,
+        errors: dict[int, str] | None = None,
+    ) -> dict:
+        """POST method for deep debug and state changes."""
+        if use_stok and self._token is None:
+            raise LuciRequestError("Token not found")
+
+        _stok: str = f";stok={self._token}/" if use_stok else ""
+        _url: str = f"{self._url}/{_stok}api/{path}"
+
+        _LOGGER.debug("MiWiFi DEEP DEBUG [POST REQ]: URL=%s | Payload=%s", _url, form_data)
+
+        try:
+            async with self._client as client:
+                response: Response = await client.post(_url, data=form_data, timeout=self._timeout)
+
+            _LOGGER.debug("MiWiFi DEEP DEBUG [POST RES]: Status=%s | Body=%s", response.status_code, response.content)
+            self._debug("Successful request", _url, response.content, path)
+            _data: dict = json.loads(response.content)
+        except Exception as _e:
+            _error_str = str(_e)
+
+            if "clear session" in _error_str or "illegal header" in _error_str or "RemoteProtocolError" in type(_e).__name__:
+                _LOGGER.debug(
+                    "MiWiFi workaround: successful command with suppressed malformed router response: %s",
+                    _error_str,
+                )
+                return {"code": 0}
+
+            _LOGGER.error("MiWiFi DEEP DEBUG [ERROR]: %s | %s", type(_e).__name__, _e)
+            self._debug("Connection/Parse error", _url, _e, path)
+            raise LuciConnectionError("Connection error") from _e
+
+        if "code" not in _data or _data["code"] > 0:
+            _code: int = -1 if "code" not in _data else int(_data["code"])
+            _LOGGER.error("MiWiFi DEEP DEBUG [API ERROR]: Code=%s, Message=%s", _code, _data.get("msg", ""))
+            self._debug("Invalid error code received", _url, _data, path)
+            if "code" in _data and errors is not None and _data["code"] in errors:
+                raise LuciError(errors[_data["code"]])
+            raise LuciRequestError(_data.get("msg", f"Invalid error code received: {_code}"))
+
+        return _data
+
     async def topo_graph(self) -> dict:
         """misystem/topo_graph method.
 
         :return dict: dict with api data.
         """
 
-        return await self.get("misystem/topo_graph", use_stok=False)
+        return await self._execute_api_action("topo_graph")
 
     async def init_info(self) -> dict:
         """xqsystem/init_info method.
@@ -208,7 +305,7 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get("xqsystem/init_info")
+        return await self._execute_api_action("init_info")
 
     async def status(self) -> dict:
         """misystem/status method.
@@ -216,7 +313,7 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get("misystem/status")
+        return await self._execute_api_action("status")
 
     async def new_status(self) -> dict:
         """misystem/newstatus method.
@@ -224,7 +321,7 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get("misystem/newstatus")
+        return await self._execute_api_action("new_status")
 
     async def mode(self) -> dict:
         """xqnetwork/mode method.
@@ -232,7 +329,7 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get("xqnetwork/mode")
+        return await self._execute_api_action("mode")
 
     async def wifi_ap_signal(self) -> dict:
         """xqnetwork/wifiap_signal method.
@@ -240,7 +337,7 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get("xqnetwork/wifiap_signal")
+        return await self._execute_api_action("wifi_ap_signal")
 
     async def wifi_detail_all(self) -> dict:
         """xqnetwork/wifi_detail_all method.
@@ -248,7 +345,7 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get("xqnetwork/wifi_detail_all")
+        return await self._execute_api_action("wifi_detail_all")
 
     async def wifi_diag_detail_all(self) -> dict:
         """xqnetwork/wifi_diag_detail_all method.
@@ -256,7 +353,7 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get("xqnetwork/wifi_diag_detail_all")
+        return await self._execute_api_action("wifi_diag_detail_all")
 
     async def vpn_status(self) -> dict:
         """xqsystem/vpn_status method.
@@ -264,7 +361,7 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get("xqsystem/vpn_status")
+        return await self._execute_api_action("vpn_status")
 
     async def set_wifi(self, data: dict) -> dict:
         """xqnetwork/set_wifi method.
@@ -273,7 +370,7 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get("xqnetwork/set_wifi", data)
+        return await self._execute_api_action("set_wifi", **data)
 
     async def set_guest_wifi(self, data: dict) -> dict:
         """xqnetwork/set_wifi_without_restart method.
@@ -282,7 +379,7 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get("xqnetwork/set_wifi_without_restart", data)
+        return await self._execute_api_action("set_guest_wifi", **data)
 
     async def avaliable_channels(self, index: int = 1) -> dict:
         """xqnetwork/avaliable_channels method.
@@ -291,7 +388,7 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get("xqnetwork/avaliable_channels", {"wifiIndex": index})
+        return await self._execute_api_action("avaliable_channels", index=index)
 
     async def wan_info(self) -> dict:
         """xqnetwork/wan_info method.
@@ -299,7 +396,7 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get("xqnetwork/wan_info")
+        return await self._execute_api_action("wan_info")
 
     async def reboot(self) -> dict:
         """xqsystem/reboot method.
@@ -307,7 +404,7 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get("xqsystem/reboot")
+        return await self._execute_api_action("reboot")
 
     async def led(self, state: int | None = None) -> dict:
         """misystem/led method.
@@ -316,11 +413,11 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        data: dict = {}
+        kwargs: dict = {}
         if state is not None:
-            data["on"] = state
+            kwargs["state"] = state
 
-        return await self.get("misystem/led", data)
+        return await self._execute_api_action("led", **kwargs)
 
     async def device_list(self) -> dict:
         """misystem/devicelist method.
@@ -328,7 +425,7 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get("misystem/devicelist")
+        return await self._execute_api_action("device_list")
 
     async def wifi_connect_devices(self) -> dict:
         """xqnetwork/wifi_connect_devices method.
@@ -336,7 +433,48 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get("xqnetwork/wifi_connect_devices")
+        return await self._execute_api_action("wifi_connect_devices")
+
+    async def set_mac_filter(self, mac: str, wan: int = 0) -> dict:
+        """xqsystem/set_mac_filter method."""
+
+        return await self._execute_api_action("set_mac_filter", mac=mac, wan=wan)
+
+    async def mac_filter_info(self) -> dict:
+        """xqsystem/mac_filter_info method.
+
+        :return dict: dict with api data.
+        """
+
+        return await self._execute_api_action("mac_filter_info")
+
+    async def macbind_info(self) -> dict:
+        """xqsystem/macbind_info method.
+
+        :return dict: dict with api data.
+        """
+
+        return await self._execute_api_action("macbind_info")
+
+    async def mac_bind(self, ip: str, mac: str, name: str) -> dict:
+        """xqsystem/mac_bind method.
+
+        :param ip: str: Device IP address
+        :param mac: str: Device MAC address
+        :param name: str: Device name
+        :return dict: dict with api data.
+        """
+
+        return await self._execute_api_action("mac_bind", ip=ip, mac=mac, name=name)
+
+    async def mac_unbind(self, mac: str) -> dict:
+        """xqsystem/mac_unbind method.
+
+        :param mac: str: Device MAC address
+        :return dict: dict with api data.
+        """
+
+        return await self._execute_api_action("mac_unbind", mac=mac)
 
     async def rom_update(self) -> dict:
         """xqsystem/check_rom_update method.
@@ -344,7 +482,7 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get("xqsystem/check_rom_update")
+        return await self._execute_api_action("rom_update")
 
     async def rom_upgrade(self, data: dict) -> dict:
         """xqsystem/upgrade_rom method.
@@ -353,17 +491,7 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get(
-            "xqsystem/upgrade_rom",
-            data,
-            errors={
-                6: "Download failed",
-                7: "No disk space",
-                8: "Download failed",
-                9: "Upgrade package verification failed",
-                10: "Failed to flash",
-            },
-        )
+        return await self._execute_api_action("rom_upgrade", **data)
 
     async def flash_permission(self) -> dict:
         """xqsystem/flash_permission method.
@@ -371,7 +499,189 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self.get("xqsystem/flash_permission")
+        return await self._execute_api_action("flash_permission")
+
+    async def port_forward_list(self) -> dict:
+        """Get port forward list."""
+        return await self._execute_api_action("get_port_forward_list")
+
+    async def add_port_forward(
+        self,
+        name: str,
+        proto: int,
+        fwd_type: int,
+        fwd_ip: str,
+        fwd_port: int,
+        ext_port: int,
+    ) -> dict:
+        """Add port forward rule."""
+        return await self._execute_api_action(
+            "add_port_forward",
+            name=name,
+            proto=proto,
+            ext_port=ext_port,
+            fwd_ip=fwd_ip,
+            fwd_port=fwd_port
+        )
+
+    async def delete_port_forward(
+        self,
+        proto: int,
+        ext_port: int,
+    ) -> dict:
+        """Delete port forward rule."""
+        return await self._execute_api_action(
+            "delete_port_forward",
+            ext_port=ext_port,
+            proto=proto
+        )
+
+    async def set_qos_switch(self, on: int) -> dict:
+        """misystem/qos_switch method.
+
+        :param on: int: 1 = enable Smart QoS, 0 = disable
+        """
+
+        return await self._execute_api_action("set_qos_switch", on=on)
+
+    async def set_qos_mode(self, mode: int) -> dict:
+        """misystem/qos_mode method.
+
+        :param mode: int: 3 = Auto, 4 = Game, 5 = Web, 6 = Video
+        """
+
+        return await self._execute_api_action("set_qos_mode", mode=mode)
+
+    async def set_band(self, upload: int, download: int) -> dict:
+        """misystem/set_band method.
+
+        :param upload: int: Global upload speed in Mbps
+        :param download: int: Global download speed in Mbps
+        """
+
+        return await self._execute_api_action(
+            "set_band", upload=upload, download=download
+        )
+
+    async def qos_info(self) -> dict:
+        """misystem/qos_info method.
+
+        :return dict: dict with api data.
+        """
+
+        return await self._execute_api_action("qos_info")
+
+    async def set_qos(
+        self, mac: str, upload: int, download: int
+    ) -> dict:
+        """misystem/qos_limits method.
+
+        :param mac: str: Device MAC address
+        :param upload: int: Upload limit in KB/s
+        :param download: int: Download limit in KB/s
+        :return dict: dict with api data.
+        """
+
+        return await self._execute_api_action(
+            "set_qos", mac=mac, upload=upload, download=download
+        )
+
+    async def wifi_timer_info(self) -> dict:
+        """xqnetwork/wifi_timer method.
+
+        :return dict: dict with api data.
+        """
+
+        return await self._execute_api_action("wifi_timer_info")
+
+    async def set_wifi_timer(
+        self,
+        start_time: str,
+        end_time: str,
+        days: str,
+        enabled: int,
+    ) -> dict:
+        """xqnetwork/set_wifi_timer method.
+
+        Global WiFi transmitter schedule (turns WiFi on/off on a schedule).
+
+        :param start_time: str: Start time when WiFi turns OFF (HH:MM)
+        :param end_time: str: End time when WiFi turns ON (HH:MM)
+        :param days: str: Days of week (e.g. "1,2,3,4,5,6,7")
+        :param enabled: int: 1 = enable schedule, 0 = disable
+        :return dict: dict with api data.
+        """
+
+        return await self._execute_api_action(
+            "set_wifi_timer",
+            start_time=start_time,
+            end_time=end_time,
+            days=days,
+            enabled=enabled,
+        )
+
+    async def set_mac_time(
+        self,
+        mac: str,
+        start_time: str,
+        end_time: str,
+        days: str,
+        enabled: int,
+    ) -> dict:
+        """misystem/set_mac_time method.
+
+        Per-device parental control: restrict internet access by schedule.
+
+        :param mac: str: Device MAC address
+        :param start_time: str: Start time of restriction (HH:MM)
+        :param end_time: str: End time of restriction (HH:MM)
+        :param days: str: Days of week (e.g. "1,2,3,4,5,6,7")
+        :param enabled: int: 1 = enable restriction, 0 = disable
+        :return dict: dict with api data.
+        """
+
+        return await self._execute_api_action(
+            "set_mac_time",
+            mac=mac,
+            start_time=start_time,
+            end_time=end_time,
+            days=days,
+            enabled=enabled,
+        )
+
+    async def add_mesh_node(self, locate_ip: str) -> dict:
+        """xqnetwork/add_mesh_node method.
+
+        :param locate_ip: str: IP address of the node to add
+        :return dict: dict with api data.
+        """
+
+        return await self._execute_api_action(
+            "add_mesh_node", locate_ip=locate_ip
+        )
+
+    async def wifi_macfilter_info(self) -> dict:
+        """xqnetwork/wifi_macfilter_info method.
+
+        :return dict: dict with api data.
+        """
+
+        return await self._execute_api_action("wifi_macfilter_info")
+
+    async def set_wifi_macfilter(self, model: int, mac: str) -> dict:
+        """xqnetwork/set_wifi_macfilter method.
+
+        Configure WiFi MAC filter mode and the list of controlled devices.
+        Different from set_mac_filter which only blocks WAN access.
+
+        :param model: int: 0 = disabled, 1 = blacklist, 2 = whitelist
+        :param mac: str: MAC address(es); multiple separated by semicolons
+        :return dict: dict with api data.
+        """
+
+        return await self._execute_api_action(
+            "set_wifi_macfilter", model=model, mac=mac
+        )
 
     def sha(self, key: str) -> str:
         """Generate sha by key.

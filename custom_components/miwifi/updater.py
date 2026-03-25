@@ -14,6 +14,8 @@ import homeassistant.components.persistent_notification as pn
 from homeassistant.const import CONF_IP_ADDRESS
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers import event
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.entity import DeviceInfo
@@ -42,6 +44,7 @@ from .const import (
     ATTR_SENSOR_DEVICES_5_0_GAME,
     ATTR_SENSOR_DEVICES_GUEST,
     ATTR_SENSOR_DEVICES_LAN,
+    ATTR_SENSOR_MAC_FILTER,
     ATTR_SENSOR_MEMORY_TOTAL,
     ATTR_SENSOR_MEMORY_USAGE,
     ATTR_SENSOR_MODE,
@@ -59,6 +62,7 @@ from .const import (
     ATTR_TRACKER_IS_RESTORED,
     ATTR_TRACKER_LAST_ACTIVITY,
     ATTR_TRACKER_MAC,
+    ATTR_TRACKER_MAC_BOUND,
     ATTR_TRACKER_NAME,
     ATTR_TRACKER_ONLINE,
     ATTR_TRACKER_OPTIONAL_MAC,
@@ -66,6 +70,9 @@ from .const import (
     ATTR_TRACKER_SIGNAL,
     ATTR_TRACKER_UP_SPEED,
     ATTR_TRACKER_UPDATER_ENTRY_ID,
+    ATTR_TRACKER_WAN,
+    ATTR_TRACKER_QOS_DOWN,
+    ATTR_TRACKER_QOS_UP,
     ATTR_UPDATE_CURRENT_VERSION,
     ATTR_UPDATE_DOWNLOAD_URL,
     ATTR_UPDATE_FILE_HASH,
@@ -76,6 +83,7 @@ from .const import (
     ATTR_UPDATE_TITLE,
     ATTR_WIFI_ADAPTER_LENGTH,
     ATTR_WIFI_DATA_FIELDS,
+    ATTR_PORT_FORWARD,
     DEFAULT_ACTIVITY_DAYS,
     DEFAULT_CALL_DELAY,
     DEFAULT_MANUFACTURER,
@@ -116,6 +124,9 @@ PREPARE_METHODS: Final = (
     "device_restore",
     "ap",
     "new_status",
+    "mac_filter",
+    "macbind",
+    "port_forward"
 )
 
 NEW_STATUS_MAP: Final = {
@@ -131,6 +142,7 @@ REPEATER_SKIP_ATTRS: Final = (
     ATTR_TRACKER_UP_SPEED,
     ATTR_TRACKER_ONLINE,
     ATTR_TRACKER_OPTIONAL_MAC,
+    ATTR_TRACKER_MAC_BOUND,
 )
 
 UNSUPPORTED: Final = {
@@ -175,6 +187,7 @@ class LuciUpdater(DataUpdateCoordinator):
     _activity_days: int
     _is_only_login: bool = False
     _is_reauthorization: bool = True
+    _is_optimistic_tracker_update: bool = False
 
     def __init__(
         self,
@@ -512,16 +525,23 @@ class LuciUpdater(DataUpdateCoordinator):
         if "temperature" in response:
             data[ATTR_SENSOR_TEMPERATURE] = float(response["temperature"])
 
-        if "wan" in response and isinstance(response["wan"], dict):
-            # fmt: off
-            data[ATTR_SENSOR_WAN_DOWNLOAD_SPEED] = float(
-                response["wan"]["downspeed"]
-            ) if "downspeed" in response["wan"] else 0
+        data[ATTR_SENSOR_WAN_DOWNLOAD_SPEED] = 0.0
+        data[ATTR_SENSOR_WAN_UPLOAD_SPEED] = 0.0
 
-            data[ATTR_SENSOR_WAN_UPLOAD_SPEED] = float(
-                response["wan"]["upspeed"]
-            ) if "upspeed" in response["wan"] else 0
-            # fmt: on
+        if "wan" in response and isinstance(response["wan"], dict):
+            _wan = response["wan"]
+
+            if "downspeed" in _wan and _wan["downspeed"] not in (None, ""):
+                try:
+                    data[ATTR_SENSOR_WAN_DOWNLOAD_SPEED] = float(_wan["downspeed"])
+                except (ValueError, TypeError):
+                    pass
+
+            if "upspeed" in _wan and _wan["upspeed"] not in (None, ""):
+                try:
+                    data[ATTR_SENSOR_WAN_UPLOAD_SPEED] = float(_wan["upspeed"])
+                except (ValueError, TypeError):
+                    pass
 
     async def _async_prepare_vpn(self, data: dict) -> None:
         """Prepare vpn.
@@ -825,6 +845,43 @@ class LuciUpdater(DataUpdateCoordinator):
 
             return
 
+        qos_data = {}
+        macbind_macs: set[str] | None = None
+        try:
+            qos_response = await self.luci.qos_info()
+
+            if "status" in qos_response:
+                self.data["qos_on"] = int(qos_response["status"].get("on", 0))
+                self.data["qos_mode"] = int(qos_response["status"].get("mode", 3))
+
+            if "band" in qos_response:
+                self.data["qos_band_up"] = int(qos_response["band"].get("upload", 1000))
+                self.data["qos_band_down"] = int(qos_response["band"].get("download", 1000))
+
+            if "list" in qos_response:
+                for q_dev in qos_response["list"]:
+                    _mac = q_dev.get("mac", "").upper()
+                    if _mac:
+                        qos_data[_mac] = {
+                            "qos_down": int(q_dev.get("qos", {}).get("downmax", 0)),
+                            "qos_up": int(q_dev.get("qos", {}).get("upmax", 0))
+                        }
+        except LuciError as _e:
+            _LOGGER.debug("Failed to get qos_info: %s", _e)
+
+        try:
+            macbind_response = await self.luci.macbind_info()
+            macbind_macs = self._extract_macbind_macs(macbind_response)
+        except LuciError as _e:
+            _LOGGER.debug("Failed to get macbind_info: %s", _e)
+
+        for device in response["list"]:
+            _device_mac = device.get(ATTR_TRACKER_MAC, device.get("mac", "")).upper()
+            device["qos_down"] = qos_data.get(_device_mac, {}).get("qos_down", 0)
+            device["qos_up"] = qos_data.get(_device_mac, {}).get("qos_up", 0)
+            if macbind_macs is not None:
+                device[ATTR_TRACKER_MAC_BOUND] = _device_mac in macbind_macs
+
         integrations: dict[str, dict] = async_get_integrations(self.hass)
 
         mac_to_ip: dict[str, str] = {
@@ -1013,6 +1070,9 @@ class LuciUpdater(DataUpdateCoordinator):
         :param action: DeviceAction: Device action
         :param integrations: dict[str, Any]: Integrations list
         """
+        
+        if not device.get(ATTR_TRACKER_MAC) or device.get(ATTR_TRACKER_MAC) == "":
+            return
 
         is_new: bool = device[ATTR_TRACKER_MAC] not in self.devices
 
@@ -1079,7 +1139,7 @@ class LuciUpdater(DataUpdateCoordinator):
         :return dict[str, Any]
         """
 
-        ip_attr: dict | None = device["ip"][0] if "ip" in device else None
+        ip_attr: dict | None = device["ip"][0] if "ip" in device and len(device["ip"]) > 0 else None
 
         if self.is_force_load and "wifiIndex" in device:
             device["type"] = 6 if device["wifiIndex"] == 3 else device["wifiIndex"]
@@ -1130,6 +1190,14 @@ class LuciUpdater(DataUpdateCoordinator):
             and ip_attr is not None
             and ip_attr["ip"] in integrations
             else None,
+            ATTR_TRACKER_WAN: int(device["authority"]["wan"])
+            if "authority" in device
+            and isinstance(device["authority"], dict)
+            and "wan" in device["authority"]
+            else None,
+            ATTR_TRACKER_MAC_BOUND: bool(device.get(ATTR_TRACKER_MAC_BOUND, False)),
+            ATTR_TRACKER_QOS_DOWN: device.get(ATTR_TRACKER_QOS_DOWN, 0),
+            ATTR_TRACKER_QOS_UP: device.get(ATTR_TRACKER_QOS_UP, 0),
         }
 
     def _mass_update_device(self, device: dict, integrations: dict) -> bool:
@@ -1200,6 +1268,88 @@ class LuciUpdater(DataUpdateCoordinator):
             _other_devices = int(data[ATTR_SENSOR_DEVICES]) - _other_devices
 
             data[ATTR_SENSOR_DEVICES_LAN] = max(_other_devices, 0)
+
+    async def _async_prepare_mac_filter(self, data: dict) -> None:
+        """Prepare MAC filter (blocked devices list).
+
+        :param data: dict
+        """
+
+        # Collect blocked MACs from authority.wan field in already-parsed devices
+        blocked_from_devices: list[str] = [
+            mac
+            for mac, dev in self.devices.items()
+            if dev.get(ATTR_TRACKER_WAN) == 0
+        ]
+
+        # Also query the dedicated endpoint (may not be supported on all models)
+        with contextlib.suppress(LuciError):
+            response: dict = await self.luci.mac_filter_info()
+
+            blocked_from_api: list[str] = []
+            for entry in response.get("list", []):
+                if isinstance(entry, str):
+                    blocked_from_api.append(entry)
+                elif isinstance(entry, dict) and "mac" in entry:
+                    blocked_from_api.append(entry["mac"])
+
+            # Merge both sources, deduplicate, preserve order
+            merged: list[str] = list(
+                dict.fromkeys(blocked_from_devices + blocked_from_api)
+            )
+            data[ATTR_SENSOR_MAC_FILTER] = merged
+            return
+
+        # Fallback: only authority.wan data available
+        data[ATTR_SENSOR_MAC_FILTER] = blocked_from_devices
+
+    async def _async_prepare_macbind(self, data: dict) -> None:
+        """Prepare MAC bind status for known devices.
+
+        :param data: dict
+        """
+
+        del data
+
+        with contextlib.suppress(LuciError):
+            response: dict = await self.luci.macbind_info()
+
+            macbind_macs: set[str] = self._extract_macbind_macs(response)
+
+            for mac, device in self.devices.items():
+                device[ATTR_TRACKER_MAC_BOUND] = mac.upper() in macbind_macs
+
+    @staticmethod
+    def _extract_macbind_macs(response: dict) -> set[str]:
+        """Extract bound MAC addresses from macbind_info response.
+
+        The router returns bound clients in `list`. On some firmwares the current
+        online clients in `devicelist` also expose the same state via `tag == 2`.
+        We merge both sources by MAC only and do not rely on IP equality because
+        a client may still be using an old DHCP lease while already present in the
+        bound list with another IP.
+
+        :param response: dict
+        :return set[str]
+        """
+
+        macbind_macs: set[str] = set()
+
+        for entry in response.get("list", []):
+            if isinstance(entry, dict) and entry.get("mac"):
+                macbind_macs.add(str(entry["mac"]).upper())
+            elif isinstance(entry, str) and entry:
+                macbind_macs.add(entry.upper())
+
+        for entry in response.get("devicelist", []):
+            if (
+                isinstance(entry, dict)
+                and entry.get("mac")
+                and int(entry.get("tag", 0)) == 2
+            ):
+                macbind_macs.add(str(entry["mac"]).upper())
+
+        return macbind_macs
 
     def _clean_devices(self) -> None:
         """Clean devices."""
@@ -1278,6 +1428,86 @@ class LuciUpdater(DataUpdateCoordinator):
 
         await self._store.async_save(self.devices)
 
+    async def async_cleanup_stale_clients(self, days: int | None = None) -> dict[str, int]:
+        """Remove stale client devices from the integration and HA registries.
+
+        :param days: int | None: Override stale age in days
+        :return dict[str, int]: Removal statistics
+        """
+
+        threshold_days = self._activity_days if days is None else days
+
+        result: dict[str, int] = {
+            "days": threshold_days,
+            "removed_clients": 0,
+            "removed_entities": 0,
+            "removed_devices": 0,
+        }
+
+        if threshold_days <= 0 or len(self.devices) == 0:
+            return result
+
+        now = datetime.now().replace(microsecond=0)
+        stale_macs: list[str] = []
+
+        for mac, device in list(self.devices.items()):
+            last_activity = device.get(ATTR_TRACKER_LAST_ACTIVITY)
+            if not isinstance(last_activity, str):
+                continue
+
+            delta = now - datetime.strptime(last_activity, "%Y-%m-%dT%H:%M:%S")
+            if int(delta.days) > threshold_days:
+                stale_macs.append(mac)
+
+        if not stale_macs:
+            return result
+
+        device_registry = dr.async_get(self.hass)
+        entity_registry = er.async_get(self.hass)
+
+        for mac in stale_macs:
+            device = device_registry.async_get_device(
+                {(DOMAIN, mac)}, {(dr.CONNECTION_NETWORK_MAC, mac)}
+            )
+
+            if device is not None:
+                for entry in er.async_entries_for_device(
+                    entity_registry, device.id, include_disabled_entities=True
+                ):
+                    if entry.config_entry_id == self._entry_id:
+                        entity_registry.async_remove(entry.entity_id)
+                        result["removed_entities"] += 1
+
+                if self._entry_id in device.config_entries:
+                    if len(device.config_entries) == 1:
+                        device_registry.async_remove_device(device.id)
+                    else:
+                        device_registry.async_update_device(
+                            device.id, remove_config_entry_id=self._entry_id
+                        )
+                    result["removed_devices"] += 1
+
+            del self.devices[mac]
+            result["removed_clients"] += 1
+
+        await self._async_save_devices()
+        self.async_set_updated_data(dict(self.data))
+
+        return result
+
+    async def _async_prepare_port_forward(self, data: dict) -> None:
+        """Prepare port forward rules.
+
+        :param data: dict
+        """
+        data[ATTR_PORT_FORWARD] = []
+
+        try:
+            pf_response: dict = await self.luci.port_forward_list()
+            if "list" in pf_response:
+                data[ATTR_PORT_FORWARD] = pf_response["list"]
+        except LuciError as _e:
+            _LOGGER.debug("Failed to get port forwards: %s", _e)
 
 @callback
 def async_get_integrations(hass: HomeAssistant) -> dict[str, dict]:

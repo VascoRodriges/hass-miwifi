@@ -27,3 +27,378 @@ request:
         on: 1
       selector:
         object:
+
+set_mac_filter:
+  name: Set MAC filter
+  description: Block or unblock a device by MAC address on the router.
+  target:
+    device:
+      integration: miwifi
+  fields:
+    mac:
+      name: MAC address
+      description: MAC address of the device to block or unblock.
+      required: true
+      example: "00:00:00:00:00:00"
+      selector:
+        text:
+    wan:
+      name: WAN access
+      description: "0 - block, 1 - unblock."
+      required: false
+      default: "0"
+      selector:
+        select:
+          options:
+            - label: "Block"
+              value: "0"
+            - label: "Unblock"
+              value: "1"
+
+macbind_info:
+  name: MAC bind info
+  description: Get the list of MAC-bound clients from the router.
+  target:
+    device:
+      integration: miwifi
+
+mac_bind:
+  name: Bind MAC
+  description: Bind a client IP address to its MAC address.
+  target:
+    device:
+      integration: miwifi
+  fields:
+    ip:
+      name: IP address
+      description: Client IP address to bind.
+      required: true
+      example: "192.168.31.100"
+      selector:
+        text:
+    mac:
+      name: MAC address
+      description: Client MAC address to bind.
+      required: true
+      example: "00:00:00:00:00:00"
+      selector:
+        text:
+    name:
+      name: Device name
+      description: Device name stored by the router for this binding.
+      required: true
+      example: "MiniPC"
+      selector:
+        text:
+
+mac_unbind:
+  name: Unbind MAC
+  description: Remove an existing IP to MAC binding.
+  target:
+    device:
+      integration: miwifi
+  fields:
+    mac:
+      name: MAC address
+      description: Client MAC address to unbind.
+      required: true
+      example: "00:00:00:00:00:00"
+      selector:
+        text:
+
+cleanup_stale_clients:
+  name: Cleanup stale clients
+  description: Remove old router clients from the integration and Home Assistant registries.
+  target:
+    device:
+      integration: miwifi
+  fields:
+    days:
+      name: Days
+      description: Override the stale age threshold in days. If omitted, the integration activity_days option is used.
+      required: false
+      example: 30
+      selector:
+        number:
+          min: 1
+          max: 3650
+          mode: box
+
+port_forward_list:
+  name: Port forward list
+  description: List all port forwarding rules on the router.
+  target:
+    device:
+      integration: miwifi
+
+add_port_forward:
+  name: Add port forward
+  description: Add a port forwarding rule.
+  target:
+    device:
+      integration: miwifi
+  fields:
+    name:
+      name: Rule name
+      description: Name of the port forwarding rule.
+      required: true
+      example: "Web server"
+      selector:
+        text:
+    proto:
+      name: Protocol
+      description: Protocol to forward.
+      required: true
+      default: tcp
+      selector:
+        select:
+          options:
+            - label: "TCP"
+              value: "tcp"
+            - label: "UDP"
+              value: "udp"
+            - label: "TCP + UDP"
+              value: "both"
+    fwd_ip:
+      name: Forward IP
+      description: Destination IP address.
+      required: true
+      example: "192.168.31.100"
+      selector:
+        text:
+    fwd_port:
+      name: Forward port
+      description: Destination port (1-65535).
+      required: true
+      example: 80
+      selector:
+        number:
+          min: 1
+          max: 65535
+          mode: box
+    ext_port:
+      name: External port
+      description: External port (1-65535).
+      required: true
+      example: 8080
+      selector:
+        number:
+          min: 1
+          max: 65535
+          mode: box
+
+delete_port_forward:
+  name: Delete port forward
+  description: Delete a port forwarding rule.
+  target:
+    device:
+      integration: miwifi
+  fields:
+    proto:
+      name: Protocol
+      description: Protocol of the rule.
+      required: true
+      default: tcp
+      selector:
+        select:
+          options:
+            - label: "TCP"
+              value: "tcp"
+            - label: "UDP"
+              value: "udp"
+            - label: "TCP + UDP"
+              value: "both"
+    ext_port:
+      name: External port
+      description: External port of the rule.
+      required: true
+      example: 8080
+      selector:
+        number:
+          min: 1
+          max: 65535
+          mode: box
+
+qos_info:
+  name: QoS info
+  description: Get QoS (bandwidth control) information.
+  target:
+    device:
+      integration: miwifi
+
+set_qos:
+  name: Set QoS
+  description: Set per-device bandwidth limit.
+  target:
+    device:
+      integration: miwifi
+  fields:
+    mac:
+      name: MAC address
+      description: MAC address of the device.
+      required: true
+      example: "00:00:00:00:00:00"
+      selector:
+        text:
+    upload:
+      name: Upload limit
+      description: Upload speed limit in KB/s. 0 for unlimited.
+      required: true
+      example: 1024
+      selector:
+        number:
+          min: 0
+          max: 1000000
+          unit_of_measurement: "KB/s"
+          mode: box
+    download:
+      name: Download limit
+      description: Download speed limit in KB/s. 0 for unlimited.
+      required: true
+      example: 2048
+      selector:
+        number:
+          min: 0
+          max: 1000000
+          unit_of_measurement: "KB/s"
+          mode: box
+
+wifi_timer_info:
+  name: WiFi timer info
+  description: Get WiFi timer (parental control) schedules.
+  target:
+    device:
+      integration: miwifi
+
+set_wifi_timer:
+  name: Set WiFi timer
+  description: Set global WiFi transmitter schedule (turns WiFi on/off at specified times).
+  target:
+    device:
+      integration: miwifi
+  fields:
+    start_time:
+      name: Start time
+      description: Time when WiFi turns OFF (HH:MM).
+      required: true
+      example: "22:00"
+      selector:
+        text:
+    end_time:
+      name: End time
+      description: Time when WiFi turns ON (HH:MM).
+      required: true
+      example: "07:00"
+      selector:
+        text:
+    days:
+      name: Days
+      description: "Days of week, comma-separated (1=Mon, 7=Sun)."
+      required: true
+      example: "1,2,3,4,5,6,7"
+      selector:
+        text:
+    enabled:
+      name: Enabled
+      description: "1 - enable schedule, 0 - disable."
+      required: false
+      default: "1"
+      selector:
+        select:
+          options:
+            - label: "Enable"
+              value: "1"
+            - label: "Disable"
+              value: "0"
+
+set_mac_time:
+  name: Set parental control
+  description: Set per-device internet access schedule (parental control via misystem/set_mac_time).
+  target:
+    device:
+      integration: miwifi
+  fields:
+    mac:
+      name: MAC address
+      description: MAC address of the device to restrict.
+      required: true
+      example: "00:00:00:00:00:00"
+      selector:
+        text:
+    start_time:
+      name: Start time
+      description: Start time of the restriction period (HH:MM).
+      required: true
+      example: "22:00"
+      selector:
+        text:
+    end_time:
+      name: End time
+      description: End time of the restriction period (HH:MM).
+      required: true
+      example: "07:00"
+      selector:
+        text:
+    days:
+      name: Days
+      description: "Days of week, comma-separated (1=Mon, 7=Sun)."
+      required: true
+      example: "1,2,3,4,5,6,7"
+      selector:
+        text:
+    enabled:
+      name: Enabled
+      description: "1 - enable restriction, 0 - disable."
+      required: false
+      default: "1"
+      selector:
+        select:
+          options:
+            - label: "Enable"
+              value: "1"
+            - label: "Disable"
+              value: "0"
+
+add_mesh_node:
+  name: Add mesh node
+  description: Add a new mesh node to the network.
+  target:
+    device:
+      integration: miwifi
+  fields:
+    locate_ip:
+      name: Node IP
+      description: IP address of the node to add to the mesh network.
+      required: true
+      example: "192.168.31.2"
+      selector:
+        text:
+
+set_wifi_macfilter:
+  name: Set WiFi MAC filter
+  description: Configure the WiFi MAC filter mode and list of controlled devices (xqnetwork/set_wifi_macfilter).
+  target:
+    device:
+      integration: miwifi
+  fields:
+    model:
+      name: Filter mode
+      description: "0 - disabled, 1 - blacklist (deny listed MACs), 2 - whitelist (allow only listed MACs)."
+      required: true
+      example: "1"
+      selector:
+        select:
+          options:
+            - label: "Disabled"
+              value: "0"
+            - label: "Blacklist"
+              value: "1"
+            - label: "Whitelist"
+              value: "2"
+    mac:
+      name: MAC address(es)
+      description: "MAC address or multiple MACs separated by semicolons (e.g. AA:BB:CC:DD:EE:FF;11:22:33:44:55:66)."
+      required: true
+      example: "00:00:00:00:00:00"
+      selector:
+        text:

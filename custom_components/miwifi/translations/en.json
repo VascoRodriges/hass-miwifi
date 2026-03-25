@@ -42,6 +42,7 @@
           "stay_online": "Minimum stay online in seconds",
           "scan_interval": "Scan interval in seconds [PRO]",
           "activity_days": "Allowed number of days to wait after the last activity [PRO]",
+          "cleanup_stale_clients": "Remove stale clients now",
           "timeout": "Timeout of requests in seconds [PRO]",
           "is_force_load": "Forced booting of devices in repeater mode [PRO]"
         }
@@ -51,6 +52,64 @@
   "system_health": {
     "info": {
       "version": "Version"
+    }
+  },
+  "services": {
+    "calc_passwd": {
+      "name": "Calculate passwd",
+      "description": "Calculate default passwd."
+    },
+    "request": {
+      "name": "Send request",
+      "description": "Send request to router."
+    },
+    "set_mac_filter": {
+      "name": "Set MAC filter",
+      "description": "Block or unblock a device by MAC address (WAN access)."
+    },
+    "port_forward_list": {
+      "name": "Port forward list",
+      "description": "List all port forwarding rules on the router."
+    },
+    "add_port_forward": {
+      "name": "Add port forward",
+      "description": "Add a port forwarding rule."
+    },
+    "delete_port_forward": {
+      "name": "Delete port forward",
+      "description": "Delete a port forwarding rule."
+    },
+    "qos_info": {
+      "name": "QoS info",
+      "description": "Get QoS (bandwidth control) information."
+    },
+    "set_qos": {
+      "name": "Set QoS",
+      "description": "Set per-device bandwidth limit."
+    },
+    "wifi_timer_info": {
+      "name": "WiFi timer info",
+      "description": "Get WiFi timer (parental control) schedules."
+    },
+    "set_wifi_timer": {
+      "name": "Set WiFi timer",
+      "description": "Set global WiFi transmitter schedule (turns WiFi on/off at specified times)."
+    },
+    "set_mac_time": {
+      "name": "Set parental control",
+      "description": "Set per-device internet access schedule (parental control)."
+    },
+    "add_mesh_node": {
+      "name": "Add mesh node",
+      "description": "Add a new mesh node to the network."
+    },
+    "set_wifi_macfilter": {
+      "name": "Set WiFi MAC filter",
+      "description": "Configure WiFi MAC filter mode (disabled/blacklist/whitelist) and controlled device list."
+    },
+    "cleanup_stale_clients": {
+      "name": "Cleanup stale clients",
+      "description": "Remove old router clients from the integration and Home Assistant registries."
     }
   }
 }

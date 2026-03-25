@@ -10,32 +10,39 @@ import homeassistant.components.persistent_notification as pn
 from homeassistant.core import HomeAssistant
 from homeassistant.loader import async_get_integration
 
+from .api_map import MIWIFI_API_MAP
 from .const import DOMAIN, NAME
 from .exceptions import LuciError
 from .luci import LuciClient
 
+
+def _ep(action: str) -> str:
+    """Get endpoint label from API map."""
+    return MIWIFI_API_MAP[action]["endpoint"]
+
+
 SELF_CHECK_METHODS: Final = (
-    ("xqsystem/login", "🟢"),
-    ("xqsystem/init_info", "🟢"),
-    ("misystem/status", "status"),
-    ("xqnetwork/mode", "mode"),
-    ("xqsystem/vpn_status", "vpn_status"),
-    ("misystem/topo_graph", "topo_graph"),
-    ("xqsystem/check_rom_update", "rom_update"),
-    ("xqnetwork/wan_info", "wan_info"),
-    ("misystem/led", "led"),
-    ("xqnetwork/wifi_detail_all", "wifi_detail_all"),
-    ("xqnetwork/wifi_diag_detail_all", "wifi_diag_detail_all"),
-    ("xqnetwork/avaliable_channels", "avaliable_channels"),
-    ("xqnetwork/wifi_connect_devices", "wifi_connect_devices"),
-    ("misystem/devicelist", "device_list"),
-    ("xqnetwork/wifiap_signal", "wifi_ap_signal"),
-    ("misystem/newstatus", "new_status"),
-    ("xqsystem/reboot", "⚪"),
-    ("xqsystem/upgrade_rom", "⚪"),
-    ("xqsystem/flash_permission", "⚪"),
-    ("xqnetwork/set_wifi", "⚪"),
-    ("xqnetwork/set_wifi_without_restart", "⚪"),
+    (_ep("login"), "🟢"),
+    (_ep("init_info"), "🟢"),
+    (_ep("status"), "status"),
+    (_ep("mode"), "mode"),
+    (_ep("vpn_status"), "vpn_status"),
+    (_ep("topo_graph"), "topo_graph"),
+    (_ep("rom_update"), "rom_update"),
+    (_ep("wan_info"), "wan_info"),
+    (_ep("led"), "led"),
+    (_ep("wifi_detail_all"), "wifi_detail_all"),
+    (_ep("wifi_diag_detail_all"), "wifi_diag_detail_all"),
+    (_ep("avaliable_channels"), "avaliable_channels"),
+    (_ep("wifi_connect_devices"), "wifi_connect_devices"),
+    (_ep("device_list"), "device_list"),
+    (_ep("wifi_ap_signal"), "wifi_ap_signal"),
+    (_ep("new_status"), "new_status"),
+    (_ep("reboot"), "⚪"),
+    (_ep("rom_upgrade"), "⚪"),
+    (_ep("flash_permission"), "⚪"),
+    (_ep("set_wifi"), "⚪"),
+    (_ep("set_guest_wifi"), "⚪"),
 )
 
 _LOGGER = logging.getLogger(__name__)

@@ -9,7 +9,7 @@ from contextlib import closing
 from functools import cached_property
 from typing import Any, Final
 
-from homeassistant.components.device_tracker import ENTITY_ID_FORMAT, SOURCE_TYPE_ROUTER
+from homeassistant.components.device_tracker import ENTITY_ID_FORMAT, SourceType
 from homeassistant.components.device_tracker.config_entry import ScannerEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
@@ -32,6 +32,7 @@ from .const import (
     ATTR_TRACKER_IS_RESTORED,
     ATTR_TRACKER_LAST_ACTIVITY,
     ATTR_TRACKER_MAC,
+    ATTR_TRACKER_MAC_BOUND,
     ATTR_TRACKER_NAME,
     ATTR_TRACKER_ONLINE,
     ATTR_TRACKER_OPTIONAL_MAC,
@@ -40,6 +41,9 @@ from .const import (
     ATTR_TRACKER_SIGNAL,
     ATTR_TRACKER_UP_SPEED,
     ATTR_TRACKER_UPDATER_ENTRY_ID,
+    ATTR_TRACKER_WAN,
+    ATTR_TRACKER_QOS_DOWN,
+    ATTR_TRACKER_QOS_UP,
     ATTRIBUTION,
     CONF_IS_TRACK_DEVICES,
     CONF_STAY_ONLINE,
@@ -70,6 +74,13 @@ ATTR_CHANGES: Final = (
     ATTR_TRACKER_DOWN_SPEED,
     ATTR_TRACKER_UP_SPEED,
     ATTR_TRACKER_OPTIONAL_MAC,
+    ATTR_TRACKER_WAN,
+    ATTR_TRACKER_MAC_BOUND,
+)
+
+OPTIMISTIC_ONLY_ATTRS: Final = (
+    ATTR_TRACKER_WAN,
+    ATTR_TRACKER_MAC_BOUND,
 )
 
 CONFIGURATION_PORTS: Final = [80, 443]
@@ -231,6 +242,18 @@ class MiWifiDeviceTracker(ScannerEntity, CoordinatorEntity):
         return self._device.get(ATTR_TRACKER_IP, None)
 
     @property
+    def hostname(self) -> str | None:
+        """Return hostname of the device.
+
+        :return str | None: Hostname
+        """
+
+        name = self._device.get(ATTR_TRACKER_NAME, None)
+        if name and name != self.mac_address:
+            return name
+        return None
+
+    @property
     def is_connected(self) -> bool:
         """Return true if the device is connected to the network.
 
@@ -238,6 +261,18 @@ class MiWifiDeviceTracker(ScannerEntity, CoordinatorEntity):
         """
 
         return self._is_connected
+
+    @property
+    def is_blocked(self) -> bool | None:
+        """Return True if WAN access is blocked for this device.
+
+        :return bool | None: None if authority data is unavailable
+        """
+
+        wan = self._device.get(ATTR_TRACKER_WAN, None)
+        if wan is None:
+            return None
+        return wan == 0
 
     @cached_property
     def unique_id(self) -> str:
@@ -298,6 +333,10 @@ class MiWifiDeviceTracker(ScannerEntity, CoordinatorEntity):
             ATTR_TRACKER_LAST_ACTIVITY: self._device.get(
                 ATTR_TRACKER_LAST_ACTIVITY, None
             ),
+            ATTR_TRACKER_WAN: self._device.get(ATTR_TRACKER_WAN, None),
+            ATTR_TRACKER_MAC_BOUND: self._device.get(ATTR_TRACKER_MAC_BOUND, False),
+            ATTR_TRACKER_QOS_DOWN: self._device.get(ATTR_TRACKER_QOS_DOWN, 0),
+            ATTR_TRACKER_QOS_UP: self._device.get(ATTR_TRACKER_QOS_UP, 0),
         }
 
     @property
@@ -351,7 +390,7 @@ class MiWifiDeviceTracker(ScannerEntity, CoordinatorEntity):
         :return str: Source type router
         """
 
-        return SOURCE_TYPE_ROUTER
+        return SourceType.ROUTER
 
     @cached_property
     def entity_registry_enabled_default(self) -> bool:
@@ -383,11 +422,17 @@ class MiWifiDeviceTracker(ScannerEntity, CoordinatorEntity):
             str(self._device.get(ATTR_TRACKER_LAST_ACTIVITY))
         )
         current: int = parse_last_activity(str(device.get(ATTR_TRACKER_LAST_ACTIVITY)))
+        is_optimistic_update: bool = getattr(
+            self._updater, "_is_optimistic_tracker_update", False
+        )
 
         is_connected = current > before
 
         if before == current:
             is_connected = (int(time.time()) - current) <= self._stay_online
+
+        if is_optimistic_update and before == current:
+            is_connected = self._is_connected
 
         attr_changed: list = [
             attr

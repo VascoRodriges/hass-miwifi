@@ -16,6 +16,8 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
+    ATTR_SELECT_QOS_MODE,
+    ATTR_SELECT_QOS_MODE_NAME,
     ATTR_SELECT_SIGNAL_STRENGTH_OPTIONS,
     ATTR_SELECT_WIFI_2_4_CHANNEL,
     ATTR_SELECT_WIFI_2_4_CHANNEL_NAME,
@@ -163,6 +165,20 @@ async def async_setup_entry(
         ]
         or updater.supports_game
     ]
+
+    if ATTR_SELECT_QOS_MODE in updater.data:
+        entities.append(
+            MiWifiQosModeSelect(
+                f"{config_entry.entry_id}-{ATTR_SELECT_QOS_MODE}",
+                SelectEntityDescription(
+                    key=ATTR_SELECT_QOS_MODE,
+                    name=ATTR_SELECT_QOS_MODE_NAME,
+                    icon="mdi:speedometer",
+                    entity_category=EntityCategory.CONFIG,
+                ),
+                updater,
+            )
+        )
 
     async_add_entities(entities)
 
@@ -349,3 +365,66 @@ class MiWifiSelect(MiWifiEntity, SelectEntity):
         icon_name: str = f"{self.entity_description.key}_{option}"
         if icon_name in ICONS:
             self._attr_icon = ICONS[icon_name]
+
+
+_QOS_MODE_MAP: Final[dict[int, str]] = {3: "auto", 4: "game", 5: "web", 6: "video"}
+_QOS_MODE_RMAP: Final[dict[str, int]] = {v: k for k, v in _QOS_MODE_MAP.items()}
+
+
+class MiWifiQosModeSelect(MiWifiEntity, SelectEntity):
+    """MiWifi QoS mode select (Auto / Game / Web / Video)."""
+
+    _attr_options: list[str] = list(_QOS_MODE_MAP.values())
+
+    def __init__(
+        self,
+        unique_id: str,
+        description: SelectEntityDescription,
+        updater: LuciUpdater,
+    ) -> None:
+        """Initialize QoS mode select."""
+
+        MiWifiEntity.__init__(self, unique_id, description, updater, ENTITY_ID_FORMAT)
+
+        raw = updater.data.get(description.key, 3)
+        self._attr_current_option = _QOS_MODE_MAP.get(int(raw), "auto")
+        self._attr_available = (
+            updater.data.get(ATTR_STATE, False)
+            and description.key in updater.data
+        )
+
+    def _handle_coordinator_update(self) -> None:
+        """Update state."""
+
+        raw = self._updater.data.get(self.entity_description.key, 3)
+        current_option = _QOS_MODE_MAP.get(int(raw), "auto")
+        is_available = (
+            self._updater.data.get(ATTR_STATE, False)
+            and self.entity_description.key in self._updater.data
+        )
+
+        if (
+            self._attr_current_option == current_option
+            and self._attr_available == is_available
+        ):
+            return
+
+        self._attr_current_option = current_option
+        self._attr_available = is_available
+        self.async_write_ha_state()
+
+    async def async_select_option(self, option: str) -> None:
+        """Select QoS mode option with Optimistic UI."""
+
+        previous_option = self._attr_current_option
+        self._attr_current_option = option
+        self.async_write_ha_state()
+
+        mode = _QOS_MODE_RMAP.get(option, 3)
+        try:
+            await self._updater.luci.set_qos_mode(mode)
+            self._updater.data[self.entity_description.key] = mode
+        except LuciError as _e:
+            _LOGGER.debug("QoS mode error: %r", _e)
+            self._attr_current_option = previous_option
+            self.async_write_ha_state()
