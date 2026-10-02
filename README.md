@@ -14,24 +14,24 @@ In addition to Home Assistant compatibility work, this fork includes service imp
 - Upstream project: [dmamontov/hass-miwifi](https://github.com/dmamontov/hass-miwifi)
 - Original author: Dmitry Mamontov
 - Integration domain: `miwifi`
-- Current manifest version in this repository: `4.0.0`
+- Current manifest version in this repository: `4.0.2`
 - Device communication model: local polling through the MiWiFi LuCI API
 
 ## Important notes
 
 - This fork is intended for routers with original MiWiFi firmware, or original firmware patched without changing the LuCI API behavior.
 - Routers running heavily modified or third-party firmware may expose different endpoints or payloads, so some features may be unavailable.
-- Automated tests cover the integration codebase, but real hardware validation of the fork-specific changes was performed only on **Xiaomi Router AX6000 (RA72)**.
+- Portable regression tests cover client identity and backend reconciliation. The legacy upstream pytest suite is not part of this fork's current CI coverage. Real hardware validation was performed only on **Xiaomi Router AX6000 (RA72)**; failure paths and destructive controls are tested with mocks, not by disrupting a live network.
 - Other Xiaomi and Redmi models may still work, especially if they were supported by the upstream project, but in this fork they should be treated as unverified until tested.
 
 ## What this fork adds
 
 - Adaptation for recent Home Assistant core APIs and platform behavior.
-- A new options flow checkbox to remove stale clients that no longer show activity on the network.
+- An options checkbox to preview stale clients without deleting them. Explicit cleanup requires separate confirmation.
 - Abstraction layer for LuCI API calls through `api_map.py`, where endpoints, request methods, and parameter mappings are centralized.
 - Extended service set for router management and diagnostics.
 - Additional `device_tracker` attributes for router-side client state.
-- Optimistic UI updates for selected operations so Home Assistant reflects changes immediately instead of waiting for the next polling cycle.
+- Optimistic updates followed by authoritative read-back, exact rollback and explicit unknown-state reporting.
 
 ## Supported Home Assistant features
 
@@ -77,10 +77,10 @@ Available options in this fork include:
 - Minimum stay-online timeout for `device_tracker`
 - Scan interval
 - Request timeout
-- Activity retention period for stale clients
-- Cleanup checkbox to immediately remove stale clients during options update
+- Stale-client age threshold (identities are retained until explicit cleanup)
+- Cleanup preview checkbox (does not delete clients during options update)
 
-The Home Assistant UI configuration flow already existed in the upstream integration. In this fork, the main UI-level addition is the checkbox that triggers stale client cleanup when the options are saved.
+The Home Assistant UI configuration flow already existed upstream. The cleanup checkbox now previews candidates; removal is a separately confirmed service action.
 
 ## LuCI API abstraction
 
@@ -114,7 +114,7 @@ These attributes make it easier to build automations around client connectivity,
 
 ## Optimistic UI behavior
 
-This fork applies optimistic updates to selected operations so entity state changes are visible in Home Assistant immediately, before the next coordinator refresh.
+After a serialized preflight read, this fork publishes the requested value before waiting for the write and confirmation. Controls do not wait for the normal polling cycle. Requests queued behind another operation or poll wait their turn; a cached desired value is never treated as confirmation.
 
 Optimistic updates are implemented for:
 
@@ -123,6 +123,16 @@ Optimistic updates are implemented for:
 - Port forwarding add and delete operations
 - QoS switch state
 - QoS mode select state
+- Router LED and WiFi/guest switches, WiFi channel and transmit power
+- Per-client QoS limits and global bandwidth
+
+Entity attributes include `operation_status`, `operation_id`, and `pending`.
+States are `pending`, `confirmed`, `failed` (fresh actual value differs), and
+`unknown` (read-back unavailable). Failure restores the actual state, or the last
+confirmed state marked unknown. Unknown router controls are unavailable until a
+fresh authoritative poll recovers them. Writes execute at most once; only reads
+are retried. Polling and changes share a per-router lock to avoid stale replies
+overwriting optimistic state. API transport/protocol failures never fabricate success.
 
 ## Services
 
@@ -131,12 +141,14 @@ The integration currently registers the following services:
 | Service | Purpose |
 |---|---|
 | `calc_passwd` | Calculate the default MiWiFi password hash for supported routers |
-| `request` | Send a raw LuCI API request and publish the response as an event |
+| `request` | Send an allowlisted read-only LuCI request and publish the response as an event; changes must use dedicated controls |
+| `get_client_status` | Read one exact client's authoritative current state |
+| `get_capabilities` | Probe read support without changing settings |
 | `set_mac_filter` | Block or unblock WAN access for a client MAC address |
 | `macbind_info` | Fetch MAC binding information from the router |
 | `mac_bind` | Bind an IP address to a MAC address |
 | `mac_unbind` | Remove an existing MAC binding |
-| `cleanup_stale_clients` | Remove stale client records from the integration and Home Assistant registries |
+| `cleanup_stale_clients` | Preview stale clients; removal requires `dry_run: false` and `confirm: true` |
 | `port_forward_list` | Read port forwarding rules |
 | `add_port_forward` | Add a port forwarding rule |
 | `delete_port_forward` | Delete a port forwarding rule |
@@ -148,6 +160,21 @@ The integration currently registers the following services:
 | `set_mac_time` | Configure per-device parental control schedule |
 | `add_mesh_node` | Add a mesh node by IP address |
 | `set_wifi_macfilter` | Configure router-level WiFi MAC filter mode |
+
+### Firmware-dependent / experimental actions
+
+`set_wifi_timer`, `set_mac_time`, `add_mesh_node`, and `set_wifi_macfilter`
+currently return **acknowledgement only** (`acknowledged: true`, `verified: false`).
+This does not prove a schedule, pairing, or filter was applied. A lost response
+raises an error without retrying the write. WiFi scheduling probes its read
+endpoint before writing; unsupported firmware fails without submitting a schedule.
+`get_capabilities` reports read-probe results, not guaranteed write support.
+Do not expose these experimental actions to Assist as verified control tools.
+
+Select the router device, not a tracked client. Services accept a single device
+ID; existing one-element `device_id` lists remain compatible. Cleanup protects
+online clients, DHCP reservations, and devices belonging to other integrations.
+There is no automatic registry deletion on ageing or options save.
 
 ## Events
 
@@ -231,7 +258,8 @@ does not invent a reserved address from a current lease.
 `set_mac_filter`, `mac_bind`, `mac_unbind` and data-returning services support an
 optional HA response. Existing read events remain compatible. WAN and DHCP writes
 must be confirmed by router readback; invalid identity, occupied address, hidden
-timeouts or unconfirmed state are errors, not optimistic success. An already-correct
+unconfirmed state is an error, not optimistic success. Lost responses can recover
+only when fresh read-back proves the requested state. An already-correct
 WAN permission is not written again. DHCP changes also check unrelated reservations.
 
 These services are primitives, not an automatic Assist exposure policy. Protect
@@ -241,8 +269,24 @@ not prove internet connectivity and does not block cellular/alternate-gateway ac
 Portable tests (no hardware/network):
 
 ```sh
-python -m unittest tests.test_client_identity
+python -m unittest tests.test_client_identity tests.test_backend_safety
 ```
+
+### Backend safety changes (4.0.2)
+
+- Correct dynamic client IDs, captured platform context, and duplicate suppression.
+- Nonblocking, bounded client port discovery; offline clients skipped; tasks cancelled on unload.
+- Serialized writes/polls with read-back and rollback for regular controls, WAN,
+  DHCP, port forwarding and QoS. Existing requests remain single-shot.
+- Firmware installation reports the version actually read from the router, never an assumed latest version.
+- Session tokens, password/hash payloads and raw exception URLs omitted from logs;
+  client identities and credential-bearing response fields redacted in diagnostics.
+- Safe entry deletion after unload, coalesced/cancelled refresh tasks, refreshed
+  service handlers and complete service field descriptions.
+- No household-specific IPs, MACs, names, or voice allowlists in the public integration.
+
+Restart Home Assistant Core after installing Python changes. Reloading only the
+config entry does not reliably reload already imported integration modules.
 
 ## Credits and upstream
 

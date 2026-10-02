@@ -12,6 +12,7 @@ from homeassistant.components.select import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -45,7 +46,6 @@ from .const import (
 )
 from .entity import MiWifiEntity
 from .enum import Wifi, DeviceClass
-from .exceptions import LuciError
 from .updater import LuciUpdater, async_get_updater
 
 PARALLEL_UPDATES = 0
@@ -232,6 +232,9 @@ class MiWifiSelect(MiWifiEntity, SelectEntity):
     def _handle_coordinator_update(self) -> None:
         """Update state."""
 
+        if self._control_pending():
+            return
+
         current_option: str = self._updater.data.get(self.entity_description.key, False)
 
         wifi_data: dict = {}
@@ -245,19 +248,6 @@ class MiWifiSelect(MiWifiEntity, SelectEntity):
             and len(self._attr_options) > 0
             and len(wifi_data) > 0
         )
-
-        data_changed: list = [
-            key
-            for key, value in wifi_data.items()
-            if key not in self._wifi_data or value != self._wifi_data[key]
-        ]
-
-        if (
-            self._attr_current_option == current_option
-            and self._attr_available == is_available
-            and not data_changed
-        ):
-            return
 
         self._attr_available = is_available
         self._attr_current_option = current_option
@@ -333,13 +323,10 @@ class MiWifiSelect(MiWifiEntity, SelectEntity):
         :param data: dict: Adapter data
         """
 
-        new_data: dict = self._wifi_data | data
-
-        try:
-            await self._updater.luci.set_wifi(new_data)
-            self._wifi_data = new_data
-        except LuciError as _e:
-            _LOGGER.debug("WiFi update error: %r", _e)
+        new_data = (
+            self._updater.data.get(DATA_MAP[self.entity_description.key], {}) | data
+        )
+        await self._updater.luci.set_wifi(new_data)
 
     async def async_select_option(self, option: str) -> None:
         """Select option
@@ -347,14 +334,16 @@ class MiWifiSelect(MiWifiEntity, SelectEntity):
         :param option: str: Option
         """
 
+        if option not in self._attr_options:
+            raise HomeAssistantError("Unsupported WiFi option")
         if action := getattr(self, f"_{self.entity_description.key}_change"):
-            await action(option)
 
-            self._updater.data[self.entity_description.key] = option
-            self._attr_current_option = option
-            self._change_icon(option)
+            def apply(actual):
+                self._updater.data[self.entity_description.key] = actual
+                self._attr_current_option = actual
+                self._change_icon(actual)
 
-            self.async_write_ha_state()
+            await self._verified_control(option, lambda: action(option), apply)
 
     def _change_icon(self, option: str) -> None:
         """Change icon
@@ -389,12 +378,14 @@ class MiWifiQosModeSelect(MiWifiEntity, SelectEntity):
         raw = updater.data.get(description.key, 3)
         self._attr_current_option = _QOS_MODE_MAP.get(int(raw), "auto")
         self._attr_available = (
-            updater.data.get(ATTR_STATE, False)
-            and description.key in updater.data
+            updater.data.get(ATTR_STATE, False) and description.key in updater.data
         )
 
     def _handle_coordinator_update(self) -> None:
         """Update state."""
+
+        if self._control_pending():
+            return
 
         raw = self._updater.data.get(self.entity_description.key, 3)
         current_option = _QOS_MODE_MAP.get(int(raw), "auto")
@@ -403,12 +394,6 @@ class MiWifiQosModeSelect(MiWifiEntity, SelectEntity):
             and self.entity_description.key in self._updater.data
         )
 
-        if (
-            self._attr_current_option == current_option
-            and self._attr_available == is_available
-        ):
-            return
-
         self._attr_current_option = current_option
         self._attr_available = is_available
         self.async_write_ha_state()
@@ -416,15 +401,14 @@ class MiWifiQosModeSelect(MiWifiEntity, SelectEntity):
     async def async_select_option(self, option: str) -> None:
         """Select QoS mode option with Optimistic UI."""
 
-        previous_option = self._attr_current_option
-        self._attr_current_option = option
-        self.async_write_ha_state()
+        if option not in _QOS_MODE_RMAP:
+            raise HomeAssistantError("Unsupported QoS mode")
+        mode = _QOS_MODE_RMAP[option]
 
-        mode = _QOS_MODE_RMAP.get(option, 3)
-        try:
-            await self._updater.luci.set_qos_mode(mode)
-            self._updater.data[self.entity_description.key] = mode
-        except LuciError as _e:
-            _LOGGER.debug("QoS mode error: %r", _e)
-            self._attr_current_option = previous_option
-            self.async_write_ha_state()
+        def apply(actual):
+            self._updater.data[self.entity_description.key] = int(actual)
+            self._attr_current_option = _QOS_MODE_MAP[int(actual)]
+
+        await self._verified_control(
+            mode, lambda: self._updater.luci.set_qos_mode(mode), apply
+        )

@@ -1,6 +1,5 @@
 """Luci data updater."""
 
-
 from __future__ import annotations
 
 import asyncio
@@ -109,6 +108,8 @@ from .exceptions import LuciConnectionError, LuciError, LuciRequestError
 from .luci import LuciClient
 from .client_identity import binding_snapshot, binding_attributes
 from .self_check import async_self_check
+from .operations import OperationManager
+from .readback import bandwidth
 
 PREPARE_METHODS: Final = (
     "init",
@@ -127,7 +128,7 @@ PREPARE_METHODS: Final = (
     "new_status",
     "mac_filter",
     "macbind",
-    "port_forward"
+    "port_forward",
 )
 
 NEW_STATUS_MAP: Final = {
@@ -253,6 +254,24 @@ class LuciUpdater(DataUpdateCoordinator):
         self._signals: dict[str, int] = {}
         self._moved_devices: list = []
         self._is_first_update: bool = True
+        self.operations = OperationManager()
+        self.port_scan_slots = asyncio.Semaphore(4)
+        self._background_tasks: set[asyncio.Task] = set()
+        self._stopped = False
+
+    def schedule_followup_refresh(self, delay: float = DEFAULT_CALL_DELAY) -> None:
+        """Coalesce follow-up refreshes and cancel them when this entry unloads."""
+        if self._stopped or self._background_tasks:
+            return
+
+        async def refresh() -> None:
+            await asyncio.sleep(delay)
+            if not self._stopped:
+                await self.async_request_refresh()
+
+        task = self.hass.async_create_task(refresh())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def async_stop(self, clean_store: bool = False) -> None:
         """Stop updater
@@ -260,15 +279,27 @@ class LuciUpdater(DataUpdateCoordinator):
         :param clean_store: bool
         """
 
+        if self._stopped:
+            if clean_store and self._store is not None:
+                await self._store.async_remove()
+            return
+        self._stopped = True
+        await self.operations.async_shutdown()
+        for task in self._background_tasks:
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
         if self.new_device_callback is not None:
             self.new_device_callback()  # pylint: disable=not-callable
+            self.new_device_callback = None
 
-        if clean_store and self._store is not None:
-            await self._store.async_remove()
-        else:
-            await self._async_save_devices()
-
-        await self.luci.logout()
+        async with self.operations.lock:
+            if clean_store and self._store is not None:
+                await self._store.async_remove()
+            else:
+                await self._async_save_devices()
+            await self.luci.logout()
 
     @cached_property
     def _update_interval(self) -> timedelta:
@@ -280,6 +311,13 @@ class LuciUpdater(DataUpdateCoordinator):
         return timedelta(seconds=self._scan_interval)
 
     async def update(self, retry: int = 1) -> dict:
+        """Polling cannot race an optimistic write or its read-back."""
+        async with self.operations.lock:
+            if self._stopped:
+                return self.data
+            return await self._update_locked(retry)
+
+    async def _update_locked(self, retry: int = 1) -> dict:
         """Update miwifi information.
 
         :param retry: int: Retry count
@@ -345,7 +383,7 @@ class LuciUpdater(DataUpdateCoordinator):
 
                 await asyncio.sleep(retry)
 
-                return await self.update(retry + 1)
+                return await self._update_locked(retry + 1)
 
         if not self._is_only_login:
             self._clean_devices()
@@ -467,9 +505,9 @@ class LuciUpdater(DataUpdateCoordinator):
             data[ATTR_DEVICE_NAME] = response["routername"]
 
         if "romversion" in response and "countrycode" in response:
-            data[
-                ATTR_DEVICE_SW_VERSION
-            ] = f"{response['romversion']} ({response['countrycode']})"
+            data[ATTR_DEVICE_SW_VERSION] = (
+                f"{response['romversion']} ({response['countrycode']})"
+            )
 
         if "hardware" in response:
             try:
@@ -654,10 +692,12 @@ class LuciUpdater(DataUpdateCoordinator):
 
         if "status" in response:
             data[ATTR_LIGHT_LED] = response["status"] == 1
+            if response["status"] in (0, 1):
+                self.operations.observe(ATTR_LIGHT_LED)
 
             return
 
-        data[ATTR_LIGHT_LED] = False
+        data.pop(ATTR_LIGHT_LED, None)
 
     async def _async_prepare_wifi(self, data: dict) -> None:
         """Prepare wifi.
@@ -698,19 +738,48 @@ class LuciUpdater(DataUpdateCoordinator):
 
             if "status" in wifi:
                 data[adapter.phrase] = int(wifi["status"]) > 0  # type: ignore
+                self.operations.observe(adapter.phrase)
 
             if "channelInfo" in wifi and "channel" in wifi["channelInfo"]:
                 data[f"{adapter.phrase}_channel"] = str(  # type: ignore
                     wifi["channelInfo"]["channel"]
                 )
+                self.operations.observe(f"{adapter.phrase}_channel")
 
             if "txpwr" in wifi:
                 data[f"{adapter.phrase}_signal_strength"] = wifi["txpwr"]  # type: ignore
+                self.operations.observe(f"{adapter.phrase}_signal_strength")
 
             if wifi_data := self._prepare_wifi_data(wifi):
                 data[f"{adapter.phrase}_data"] = wifi_data  # type: ignore
 
         data[ATTR_WIFI_ADAPTER_LENGTH] = length
+
+    async def read_control(self, key: str) -> Any:
+        """Read a control freshly, never returning a retained coordinator value."""
+        if key == ATTR_LIGHT_LED:
+            response = await self.luci.led()
+            if type(response.get("status")) is not int or response["status"] not in (
+                0,
+                1,
+            ):
+                raise ValueError("LED state unavailable")
+            return bool(response["status"])
+        if key in {"qos_on", "qos_mode"}:
+            response = await self.luci.qos_info()
+            value = response.get("status", {}).get("on" if key == "qos_on" else "mode")
+            if value is None:
+                raise ValueError("QoS state unavailable")
+            value = int(value)
+            if value not in ((0, 1) if key == "qos_on" else (3, 4, 5, 6)):
+                raise ValueError("Invalid QoS state")
+            return value
+        fresh = {}
+        await self._async_prepare_wifi(fresh)
+        if key not in fresh:
+            raise ValueError("WiFi control state unavailable")
+        self.data.update(fresh)
+        return fresh[key]
 
     async def _async_prepare_wifi_guest(self, adapters: list) -> list:
         """Prepare wifi guest.
@@ -719,26 +788,21 @@ class LuciUpdater(DataUpdateCoordinator):
         :return list: adapters
         """
 
-        if not self.supports_guest:  # pragma: no cover
-            return adapters
-
-        self.supports_guest = False
-
-        with contextlib.suppress(LuciError):
+        try:
             response_diag = await self.luci.wifi_diag_detail_all()
-            _adapters_len: int = len(adapters)
-
-            if "info" in response_diag:
-                adapters += [
-                    _adapter
-                    for _adapter in response_diag["info"]
-                    if "ifname" in _adapter and _adapter["ifname"] == IfName.WL14.value
-                ]
-
-            if _adapters_len < len(adapters):
-                self.supports_guest = True
-
-        return adapters
+        except LuciError:
+            return adapters  # A transient failure does not disable a capability.
+        if not isinstance(response_diag.get("info"), list):
+            return adapters
+        guests = [
+            item
+            for item in response_diag["info"]
+            if isinstance(item, dict) and item.get("ifname") == IfName.WL14.value
+        ]
+        self.supports_guest = bool(guests)
+        return [
+            item for item in adapters if item.get("ifname") != IfName.WL14.value
+        ] + guests
 
     @staticmethod
     def _prepare_wifi_data(data: dict) -> dict:
@@ -852,22 +916,27 @@ class LuciUpdater(DataUpdateCoordinator):
             qos_response = await self.luci.qos_info()
 
             if "status" in qos_response:
-                self.data["qos_on"] = int(qos_response["status"].get("on", 0))
-                self.data["qos_mode"] = int(qos_response["status"].get("mode", 3))
+                for key, field in (("qos_on", "on"), ("qos_mode", "mode")):
+                    if field in qos_response["status"]:
+                        self.data[key] = int(qos_response["status"][field])
+                        self.operations.observe(key)
 
             if "band" in qos_response:
-                self.data["qos_band_up"] = int(qos_response["band"].get("upload", 1000))
-                self.data["qos_band_down"] = int(qos_response["band"].get("download", 1000))
+                values = bandwidth(qos_response)
+                self.data["qos_band_up"], self.data["qos_band_down"] = map(int, values)
+                self.operations.observe("qos_band")
 
             if "list" in qos_response:
                 for q_dev in qos_response["list"]:
                     _mac = q_dev.get("mac", "").upper()
                     if _mac:
-                        qos_data[_mac] = {
-                            "qos_down": int(q_dev.get("qos", {}).get("downmax", 0)),
-                            "qos_up": int(q_dev.get("qos", {}).get("upmax", 0))
-                        }
-        except LuciError as _e:
+                        try:
+                            up, down = bandwidth(qos_response, _mac)
+                        except ValueError:
+                            continue
+                        qos_data[_mac] = {"qos_down": int(down), "qos_up": int(up)}
+                        self.operations.observe(f"qos:{_mac}")
+        except (LuciError, ValueError, TypeError) as _e:
             _LOGGER.debug("Failed to get qos_info: %s", _e)
 
         try:
@@ -880,9 +949,18 @@ class LuciUpdater(DataUpdateCoordinator):
             _device_mac = device.get(ATTR_TRACKER_MAC, device.get("mac", "")).upper()
             device["qos_down"] = qos_data.get(_device_mac, {}).get("qos_down", 0)
             device["qos_up"] = qos_data.get(_device_mac, {}).get("qos_up", 0)
-            current = device.get('ip', [])
-            current_ip = current[0].get('ip') if current and isinstance(current[0], dict) else None
+            current = device.get("ip", [])
+            current_ip = (
+                current[0].get("ip")
+                if current and isinstance(current[0], dict)
+                else None
+            )
             device.update(binding_attributes(bindings, _device_mac, current_ip))
+            if bindings is not None:
+                self.operations.observe(f"binding:{_device_mac}")
+            authority = device.get("authority", {})
+            if isinstance(authority, dict) and str(authority.get("wan")) in {"0", "1"}:
+                self.operations.observe(f"wan:{_device_mac}")
 
         integrations: dict[str, dict] = async_get_integrations(self.hass)
 
@@ -1072,13 +1150,28 @@ class LuciUpdater(DataUpdateCoordinator):
         :param action: DeviceAction: Device action
         :param integrations: dict[str, Any]: Integrations list
         """
-        
+
         if not device.get(ATTR_TRACKER_MAC) or device.get(ATTR_TRACKER_MAC) == "":
             return
 
         is_new: bool = device[ATTR_TRACKER_MAC] not in self.devices
 
         _device: dict[str, Any] = self._build_device(device, integrations)
+        mac = device[ATTR_TRACKER_MAC]
+        relevant = [
+            record
+            for key, record in self.operations.records.items()
+            if key.endswith(f":{mac}")
+        ]
+        if relevant:
+            record = max(relevant, key=lambda item: item.request_id)
+            _device.update(
+                {
+                    "operation_status": record.status,
+                    "operation_id": record.request_id,
+                    "pending": record.status == "pending",
+                }
+            )
 
         if (
             self.is_repeater
@@ -1111,9 +1204,7 @@ class LuciUpdater(DataUpdateCoordinator):
                 self.hass, SIGNAL_NEW_DEVICE, self.devices[device[ATTR_TRACKER_MAC]]
             )
 
-            _LOGGER.debug(
-                "Found new device: %s", self.devices[device[ATTR_TRACKER_MAC]]
-            )
+            _LOGGER.debug("Found new router client")
         elif action == DeviceAction.MOVE:
             _LOGGER.debug("Move device: %s", device[ATTR_TRACKER_MAC])
 
@@ -1141,7 +1232,9 @@ class LuciUpdater(DataUpdateCoordinator):
         :return dict[str, Any]
         """
 
-        ip_attr: dict | None = device["ip"][0] if "ip" in device and len(device["ip"]) > 0 else None
+        ip_attr: dict | None = (
+            device["ip"][0] if "ip" in device and len(device["ip"]) > 0 else None
+        )
 
         if self.is_force_load and "wifiIndex" in device:
             device["type"] = 6 if device["wifiIndex"] == 3 else device["wifiIndex"]
@@ -1283,9 +1376,7 @@ class LuciUpdater(DataUpdateCoordinator):
 
         # Collect blocked MACs from authority.wan field in already-parsed devices
         blocked_from_devices: list[str] = [
-            mac
-            for mac, dev in self.devices.items()
-            if dev.get(ATTR_TRACKER_WAN) == 0
+            mac for mac, dev in self.devices.items() if dev.get(ATTR_TRACKER_WAN) == 0
         ]
 
         # Also query the dedicated endpoint (may not be supported on all models)
@@ -1321,7 +1412,9 @@ class LuciUpdater(DataUpdateCoordinator):
             response: dict = await self.luci.macbind_info()
             bindings = binding_snapshot(response)
             for mac, device in self.devices.items():
-                device.update(binding_attributes(bindings, mac, device.get(ATTR_TRACKER_IP)))
+                device.update(
+                    binding_attributes(bindings, mac, device.get(ATTR_TRACKER_IP))
+                )
 
     @staticmethod
     def _extract_macbind_macs(response: dict) -> set[str]:
@@ -1341,7 +1434,7 @@ class LuciUpdater(DataUpdateCoordinator):
         return set(binding_snapshot(response))
 
     def _clean_devices(self) -> None:
-        """Clean devices."""
+        """Mark retained clients as stale; deletion requires explicit cleanup."""
 
         if self._activity_days == 0 or len(self.devices) == 0:
             return
@@ -1360,14 +1453,13 @@ class LuciUpdater(DataUpdateCoordinator):
 
                 continue
 
-            delta = now - datetime.strptime(
-                device[ATTR_TRACKER_LAST_ACTIVITY], "%Y-%m-%dT%H:%M:%S"
-            )
-
-            if int(delta.days) <= self._activity_days:
+            try:
+                delta = now - datetime.strptime(
+                    device[ATTR_TRACKER_LAST_ACTIVITY], "%Y-%m-%dT%H:%M:%S"
+                )
+            except ValueError:
                 continue
-
-            del self.devices[mac]
+            device["stale"] = int(delta.days) > self._activity_days
 
     def reset_counter(self, is_force: bool = False, is_remove: bool = False) -> None:
         """Reset counter
@@ -1417,7 +1509,16 @@ class LuciUpdater(DataUpdateCoordinator):
 
         await self._store.async_save(self.devices)
 
-    async def async_cleanup_stale_clients(self, days: int | None = None) -> dict[str, int]:
+    async def async_cleanup_stale_clients(
+        self, days: int | None = None, *, dry_run: bool = True
+    ) -> dict:
+        """Preview by default; serialize explicit cleanup with router polling."""
+        async with self.operations.lock:
+            return await self._cleanup_stale_clients_locked(days, dry_run=dry_run)
+
+    async def _cleanup_stale_clients_locked(
+        self, days: int | None = None, *, dry_run: bool = True
+    ) -> dict:
         """Remove stale client devices from the integration and HA registries.
 
         :param days: int | None: Override stale age in days
@@ -1431,6 +1532,8 @@ class LuciUpdater(DataUpdateCoordinator):
             "removed_clients": 0,
             "removed_entities": 0,
             "removed_devices": 0,
+            "dry_run": dry_run,
+            "candidates": [],
         }
 
         if threshold_days <= 0 or len(self.devices) == 0:
@@ -1439,12 +1542,27 @@ class LuciUpdater(DataUpdateCoordinator):
         now = datetime.now().replace(microsecond=0)
         stale_macs: list[str] = []
 
+        bindings = binding_snapshot(await self.luci.macbind_info())
+        live_response = await self.luci.device_list()
+        if not isinstance(live_response.get("list"), list):
+            raise ValueError("Current clients unavailable; cleanup cancelled")
+        online_macs = {
+            str(row.get("mac", "")).upper()
+            for row in live_response["list"]
+            if isinstance(row, dict) and str(row.get("online")) == "1"
+        }
+
         for mac, device in list(self.devices.items()):
+            if mac.upper() in bindings or mac.upper() in online_macs:
+                continue
             last_activity = device.get(ATTR_TRACKER_LAST_ACTIVITY)
             if not isinstance(last_activity, str):
                 continue
 
-            delta = now - datetime.strptime(last_activity, "%Y-%m-%dT%H:%M:%S")
+            try:
+                delta = now - datetime.strptime(last_activity, "%Y-%m-%dT%H:%M:%S")
+            except ValueError:
+                continue
             if int(delta.days) > threshold_days:
                 stale_macs.append(mac)
 
@@ -1458,6 +1576,13 @@ class LuciUpdater(DataUpdateCoordinator):
             device = device_registry.async_get_device(
                 {(DOMAIN, mac)}, {(dr.CONNECTION_NETWORK_MAC, mac)}
             )
+
+            if device is not None:
+                if device.config_entries - {self._entry_id}:
+                    continue
+            result["candidates"].append(mac)
+            if dry_run:
+                continue
 
             if device is not None:
                 for entry in er.async_entries_for_device(
@@ -1479,8 +1604,9 @@ class LuciUpdater(DataUpdateCoordinator):
             del self.devices[mac]
             result["removed_clients"] += 1
 
-        await self._async_save_devices()
-        self.async_set_updated_data(dict(self.data))
+        if not dry_run:
+            await self._async_save_devices()
+            self.async_set_updated_data(dict(self.data))
 
         return result
 
@@ -1489,14 +1615,14 @@ class LuciUpdater(DataUpdateCoordinator):
 
         :param data: dict
         """
-        data[ATTR_PORT_FORWARD] = []
-
         try:
             pf_response: dict = await self.luci.port_forward_list()
             if "list" in pf_response:
                 data[ATTR_PORT_FORWARD] = pf_response["list"]
+                self.operations.observe("port_forward")
         except LuciError as _e:
             _LOGGER.debug("Failed to get port forwards: %s", _e)
+
 
 @callback
 def async_get_integrations(hass: HomeAssistant) -> dict[str, dict]:

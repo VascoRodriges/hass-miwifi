@@ -16,6 +16,7 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant
 
 from .updater import async_get_updater
+from .privacy import redact
 
 TO_REDACT: Final = {
     CONF_PASSWORD,
@@ -49,4 +50,4 @@ async def async_get_config_entry_diagnostics(
         if len(_updater.luci.diagnostics) > 0:
             _data["requests"] = async_redact_data(_updater.luci.diagnostics, TO_REDACT)
 
-    return _data
+    return redact(_data)

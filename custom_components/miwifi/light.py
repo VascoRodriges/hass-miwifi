@@ -1,9 +1,7 @@
 """Light component."""
 
-
 from __future__ import annotations
 
-import contextlib
 import logging
 from typing import Any, Final
 
@@ -21,7 +19,6 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import ATTR_LIGHT_LED, ATTR_LIGHT_LED_NAME, ATTR_STATE
 from .entity import MiWifiEntity
-from .exceptions import LuciError
 from .updater import LuciUpdater, async_get_updater
 
 PARALLEL_UPDATES = 0
@@ -97,14 +94,16 @@ class MiWifiLight(MiWifiEntity, LightEntity):
     def _handle_coordinator_update(self) -> None:
         """Update state."""
 
+        if self._control_pending():
+            return
+
         is_available: bool = self._updater.data.get(ATTR_STATE, False)
 
         is_on: bool = self._updater.data.get(self.entity_description.key, False)
 
-        if self._attr_is_on == is_on and self._attr_available == is_available:  # type: ignore
-            return
-
-        self._attr_available = is_available
+        self._attr_available = (
+            is_available and self.entity_description.key in self._updater.data
+        )
         self._attr_is_on = is_on
 
         self._change_icon(is_on)
@@ -114,14 +113,12 @@ class MiWifiLight(MiWifiEntity, LightEntity):
     async def _led_on(self) -> None:
         """Led on action"""
 
-        with contextlib.suppress(LuciError):
-            await self._updater.luci.led(1)
+        await self._updater.luci.led(1)
 
     async def _led_off(self) -> None:
         """Led off action"""
 
-        with contextlib.suppress(LuciError):
-            await self._updater.luci.led(0)
+        await self._updater.luci.led(0)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on action
@@ -152,15 +149,13 @@ class MiWifiLight(MiWifiEntity, LightEntity):
         """
 
         if action := getattr(self, method):
-            await action()
 
-            is_on: bool = state == STATE_ON
+            def apply(is_on):
+                self._updater.data[self.entity_description.key] = is_on
+                self._attr_is_on = is_on
+                self._change_icon(is_on)
 
-            self._updater.data[self.entity_description.key] = is_on
-            self._attr_is_on = is_on
-            self._change_icon(is_on)
-
-            self.async_write_ha_state()
+            await self._verified_control(state == STATE_ON, action, apply)
 
     def _change_icon(self, is_on: bool) -> None:
         """Change icon

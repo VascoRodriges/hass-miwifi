@@ -15,6 +15,7 @@ from custom_components.miwifi.client_identity import (
     wan_authority,
 )
 from custom_components.miwifi.exceptions import LuciConnectionError
+from custom_components.miwifi.operations import OperationManager
 from custom_components.miwifi.services import (
     MiWifiClientStatusServiceCall,
     MiWifiMacBindServiceCall,
@@ -138,6 +139,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             devices={MAC: {"ip": IP, "wan": 1}},
             data={},
             ip="192.168.31.1",
+            operations=OperationManager(delay=0),
         )
         service = cls(Mock())
         service.get_updater = Mock(return_value=updater)
@@ -174,7 +176,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_stale_readback_never_claims_success_or_retries_write(self):
         service, updater = self.service(MiWifiSetMacFilterServiceCall)
         with patch(
-            "custom_components.miwifi.services.asyncio.sleep", new_callable=AsyncMock
+            "custom_components.miwifi.operations.asyncio.sleep", new_callable=AsyncMock
         ):
             with self.assertRaises(miwifi_services.vol.Invalid):
                 await service.async_call_service(
@@ -201,7 +203,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         updater.luci.mac_bind.assert_not_called()
 
-    async def test_bind_readback_required_and_no_optimistic_on_failure(self):
+    async def test_bind_readback_required_and_optimistic_state_rolled_back(self):
         service, updater = self.service(MiWifiMacBindServiceCall)
         updater.luci.macbind_info.return_value = reservations(ip="192.168.31.60")
         with self.assertRaises(miwifi_services.vol.Invalid):
@@ -209,16 +211,19 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 SimpleNamespace(data={"mac": MAC, "ip": IP, "name": "phone"})
             )
         updater.luci.mac_bind.assert_awaited_once()
-        service._publish_optimistic_update.assert_not_called()
+        self.assertEqual(updater.devices[MAC]["bound_ip"], "192.168.31.60")
+        self.assertEqual(updater.operations.records[f"binding:{MAC}"].status, "failed")
 
     async def test_bind_timeout_is_error_not_silent_success(self):
         service, updater = self.service(MiWifiMacBindServiceCall)
+        updater.luci.macbind_info.return_value = reservations(ip="192.168.31.60")
         updater.luci.mac_bind.side_effect = LuciConnectionError("Connection error")
         with self.assertRaises(miwifi_services.vol.Invalid):
             await service.async_call_service(
                 SimpleNamespace(data={"mac": MAC, "ip": IP, "name": "phone"})
             )
-        service._publish_optimistic_update.assert_not_called()
+        updater.luci.mac_bind.assert_awaited_once()
+        self.assertEqual(updater.devices[MAC]["bound_ip"], "192.168.31.60")
 
     async def test_verified_unbind(self):
         service, updater = self.service(MiWifiMacUnbindServiceCall)

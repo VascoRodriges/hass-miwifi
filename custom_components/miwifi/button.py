@@ -12,6 +12,8 @@ from homeassistant.components.button import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from .operations import manager_for
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -95,9 +97,12 @@ class MiWifiButton(MiWifiEntity, ButtonEntity):
         """Press reboot."""
 
         try:
-            await self._updater.luci.reboot()
+            async with manager_for(self._updater).lock:
+                await self._updater.luci.reboot()
         except LuciError as _e:
-            _LOGGER.debug("Reboot error: %r", _e)
+            raise HomeAssistantError(
+                "Router reboot acknowledgement unavailable; command was not retried"
+            ) from _e
 
     async def async_press(self) -> None:
         """Async press action."""

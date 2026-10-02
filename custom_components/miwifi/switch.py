@@ -36,7 +36,6 @@ from .const import (
 )
 from .entity import MiWifiEntity
 from .enum import Wifi
-from .exceptions import LuciError
 from .updater import LuciUpdater, async_get_updater
 
 PARALLEL_UPDATES = 0
@@ -171,6 +170,9 @@ class MiWifiSwitch(MiWifiEntity, SwitchEntity):
     def _handle_coordinator_update(self) -> None:
         """Update state."""
 
+        if self._control_pending():
+            return
+
         is_on: bool = self._updater.data.get(self.entity_description.key, False)
 
         wifi_data: dict = {}
@@ -180,19 +182,6 @@ class MiWifiSwitch(MiWifiEntity, SwitchEntity):
             )
 
         is_available: bool = self._additional_prepare() and len(wifi_data) > 0
-
-        data_changed: list = [
-            key
-            for key, value in wifi_data.items()
-            if key not in self._wifi_data or value != self._wifi_data[key]
-        ]
-
-        if (
-            self._attr_is_on == is_on
-            and self._attr_available == is_available
-            and not data_changed
-        ):
-            return
 
         self._attr_available = is_available
         self._attr_is_on = is_on
@@ -264,13 +253,12 @@ class MiWifiSwitch(MiWifiEntity, SwitchEntity):
         :param data: dict: Adapter data
         """
 
-        new_data: dict = self._wifi_data | data
-
-        try:
-            await self._updater.luci.set_wifi(new_data)
-            self._wifi_data = new_data
-        except LuciError as _e:
-            _LOGGER.debug("WiFi update error: %r", _e)
+        # The preflight read refreshed the complete adapter payload inside the
+        # router lock. Do not overwrite a preceding select's channel/password.
+        new_data = (
+            self._updater.data.get(DATA_MAP[self.entity_description.key], {}) | data
+        )
+        await self._updater.luci.set_wifi(new_data)
 
     async def _async_update_guest_wifi(self, data: dict) -> None:
         """Update guest wifi
@@ -278,13 +266,10 @@ class MiWifiSwitch(MiWifiEntity, SwitchEntity):
         :param data: dict: Guest data
         """
 
-        new_data: dict = self._wifi_data | data
-
-        try:
-            await self._updater.luci.set_guest_wifi(new_data)
-            self._wifi_data = new_data
-        except LuciError as _e:
-            _LOGGER.debug("WiFi update error: %r", _e)
+        new_data = (
+            self._updater.data.get(DATA_MAP[self.entity_description.key], {}) | data
+        )
+        await self._updater.luci.set_guest_wifi(new_data)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on action
@@ -315,15 +300,13 @@ class MiWifiSwitch(MiWifiEntity, SwitchEntity):
         """
 
         if action := getattr(self, method):
-            await action()
 
-            is_on: bool = state == STATE_ON
+            def apply(is_on):
+                self._updater.data[self.entity_description.key] = is_on
+                self._attr_is_on = is_on
+                self._change_icon(is_on)
 
-            self._updater.data[self.entity_description.key] = is_on
-            self._attr_is_on = is_on
-            self._change_icon(is_on)
-
-            self.async_write_ha_state()
+            await self._verified_control(state == STATE_ON, action, apply)
 
     def _additional_prepare(self) -> bool:
         """Prepare wifi switch
@@ -372,12 +355,14 @@ class MiWifiQosSwitch(MiWifiEntity, SwitchEntity):
 
         self._attr_is_on = bool(updater.data.get(description.key, 0))
         self._attr_available = (
-            updater.data.get(ATTR_STATE, False)
-            and description.key in updater.data
+            updater.data.get(ATTR_STATE, False) and description.key in updater.data
         )
 
     def _handle_coordinator_update(self) -> None:
         """Update state."""
+
+        if self._control_pending():
+            return
 
         is_on = bool(self._updater.data.get(self.entity_description.key, 0))
         is_available = (
@@ -385,36 +370,24 @@ class MiWifiQosSwitch(MiWifiEntity, SwitchEntity):
             and self.entity_description.key in self._updater.data
         )
 
-        if self._attr_is_on == is_on and self._attr_available == is_available:
-            return
-
         self._attr_is_on = is_on
         self._attr_available = is_available
         self.async_write_ha_state()
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on QoS with Optimistic UI."""
-        self._attr_is_on = True
-        self.async_write_ha_state()
-
-        try:
-            await self._updater.luci.set_qos_switch(1)
-            self._updater.data[self.entity_description.key] = 1
-        except LuciError as _e:
-            _LOGGER.debug("QoS switch error: %r", _e)
-            self._attr_is_on = False
-            self.async_write_ha_state()
+        await self._change_qos(1)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off QoS with Optimistic UI."""
 
-        self._attr_is_on = False
-        self.async_write_ha_state()
+        await self._change_qos(0)
 
-        try:
-            await self._updater.luci.set_qos_switch(0)
-            self._updater.data[self.entity_description.key] = 0
-        except LuciError as _e:
-            _LOGGER.debug("QoS switch error: %r", _e)
-            self._attr_is_on = True
-            self.async_write_ha_state()
+    async def _change_qos(self, desired: int) -> None:
+        def apply(actual):
+            self._updater.data[self.entity_description.key] = int(actual)
+            self._attr_is_on = bool(actual)
+
+        await self._verified_control(
+            desired, lambda: self._updater.luci.set_qos_switch(desired), apply
+        )

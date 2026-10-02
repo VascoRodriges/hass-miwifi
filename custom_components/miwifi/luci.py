@@ -27,7 +27,12 @@ from .const import (
     DIAGNOSTIC_MESSAGE,
 )
 from .enum import EncryptionAlgorithm
-from .exceptions import LuciConnectionError, LuciError, LuciRequestError
+from .exceptions import (
+    LuciConnectionError,
+    LuciError,
+    LuciRequestError,
+    LuciWriteUncertainError,
+)
 from .api_map import MIWIFI_API_MAP
 
 _LOGGER = logging.getLogger(__name__)
@@ -78,7 +83,7 @@ class LuciClient:
 
     async def _execute_api_action(self, action_name: str, **kwargs: Any) -> dict:
         """Universal API action executor based on the manifest."""
-        
+
         schema = MIWIFI_API_MAP.get(action_name)
         if not schema:
             raise ValueError(f"Action '{action_name}' not found in API_MAP")
@@ -121,9 +126,21 @@ class LuciClient:
             query_params.update(static_params)
         if payload:
             query_params.update(payload)
-        return await self.get(
-            endpoint, query_params or None, use_stok=use_stok, errors=errors
-        )
+        try:
+            return await self.get(
+                endpoint, query_params or None, use_stok=use_stok, errors=errors
+            )
+        except LuciConnectionError as err:
+            if action_name in {
+                "set_wifi",
+                "set_guest_wifi",
+                "rom_upgrade",
+                "reboot",
+            } or (action_name == "led" and "state" in kwargs):
+                raise LuciWriteUncertainError(
+                    "Write response unavailable; read back before retrying"
+                ) from err
+            raise
 
     async def login(self) -> dict:
         """Login method
@@ -154,13 +171,16 @@ class LuciClient:
 
             self._debug("Successful request", _url, response.content, _method)
 
+            if response.status_code in (401, 403):
+                raise LuciRequestError("Router authentication rejected")
+            response.raise_for_status()
             _data: dict = json.loads(response.content)
         except (HTTPError, ConnectError, TransportError, ValueError, TypeError) as _e:
             self._debug("Connection error", _url, _e, _method)
 
-            raise LuciConnectionError("Connection error") from _e
+            raise LuciConnectionError("Connection error") from None
 
-        if response.status_code != 200 or "token" not in _data:
+        if not isinstance(_data, dict) or "token" not in _data:
             self._debug("Failed to get token", _url, _data, _method)
 
             raise LuciRequestError("Failed to get token")
@@ -217,6 +237,9 @@ class LuciClient:
 
             self._debug("Successful request", _url, response.content, path)
 
+            if response.status_code in (401, 403):
+                raise LuciRequestError("Router authentication rejected")
+            response.raise_for_status()
             _data: dict = json.loads(response.content)
         except (
             HTTPError,
@@ -228,21 +251,9 @@ class LuciClient:
         ) as _e:
             self._debug("Connection error", _url, _e, path)
 
-            raise LuciConnectionError("Connection error") from _e
+            raise LuciConnectionError("Connection error") from None
 
-        if "code" not in _data or _data["code"] > 0:
-            _code: int = -1 if "code" not in _data else int(_data["code"])
-
-            self._debug("Invalid error code received", _url, _data, path)
-
-            if "code" in _data and errors is not None and _data["code"] in errors:
-                raise LuciError(errors[_data["code"]])
-
-            raise LuciRequestError(
-                _data.get("msg", f"Invalid error code received: {_code}")
-            )
-
-        return _data
+        return self._validate_response(_data, errors)
 
     async def post(
         self,
@@ -258,38 +269,33 @@ class LuciClient:
         _stok: str = f";stok={self._token}/" if use_stok else ""
         _url: str = f"{self._url}/{_stok}api/{path}"
 
-        _LOGGER.debug("MiWiFi DEEP DEBUG [POST REQ]: URL=%s | Payload=%s", _url, form_data)
-
         try:
             async with self._client as client:
-                response: Response = await client.post(_url, data=form_data, timeout=self._timeout)
-
-            _LOGGER.debug("MiWiFi DEEP DEBUG [POST RES]: Status=%s | Body=%s", response.status_code, response.content)
-            self._debug("Successful request", _url, response.content, path)
-            _data: dict = json.loads(response.content)
-        except Exception as _e:
-            _error_str = str(_e)
-
-            if "clear session" in _error_str or "illegal header" in _error_str or "RemoteProtocolError" in type(_e).__name__:
-                _LOGGER.debug(
-                    "MiWiFi workaround: successful command with suppressed malformed router response: %s",
-                    _error_str,
+                response: Response = await client.post(
+                    _url, data=form_data, timeout=self._timeout
                 )
-                return {"code": 0}
 
-            _LOGGER.error("MiWiFi DEEP DEBUG [ERROR]: %s | %s", type(_e).__name__, _e)
+            self._debug("Successful request", _url, response.content, path)
+            response.raise_for_status()
+            _data: dict = json.loads(response.content)
+        except (HTTPError, ValueError, TypeError) as _e:
             self._debug("Connection/Parse error", _url, _e, path)
-            raise LuciConnectionError("Connection error") from _e
+            raise LuciWriteUncertainError(
+                "Write response unavailable; read back before retrying"
+            ) from None
 
-        if "code" not in _data or _data["code"] > 0:
-            _code: int = -1 if "code" not in _data else int(_data["code"])
-            _LOGGER.error("MiWiFi DEEP DEBUG [API ERROR]: Code=%s, Message=%s", _code, _data.get("msg", ""))
-            self._debug("Invalid error code received", _url, _data, path)
-            if "code" in _data and errors is not None and _data["code"] in errors:
-                raise LuciError(errors[_data["code"]])
-            raise LuciRequestError(_data.get("msg", f"Invalid error code received: {_code}"))
+        return self._validate_response(_data, errors)
 
-        return _data
+    @staticmethod
+    def _validate_response(data: Any, errors: dict | None = None) -> dict:
+        """Do not accept lists, missing codes, negative codes, or HTML as success."""
+        if not isinstance(data, dict) or type(data.get("code")) is not int:
+            raise LuciRequestError("Invalid router response")
+        if data["code"] != 0:
+            if errors and data["code"] in errors:
+                raise LuciError(errors[data["code"]])
+            raise LuciRequestError(f"Router API error code: {data['code']}")
+        return data
 
     async def topo_graph(self) -> dict:
         """misystem/topo_graph method.
@@ -521,7 +527,7 @@ class LuciClient:
             proto=proto,
             ext_port=ext_port,
             fwd_ip=fwd_ip,
-            fwd_port=fwd_port
+            fwd_port=fwd_port,
         )
 
     async def delete_port_forward(
@@ -531,9 +537,7 @@ class LuciClient:
     ) -> dict:
         """Delete port forward rule."""
         return await self._execute_api_action(
-            "delete_port_forward",
-            ext_port=ext_port,
-            proto=proto
+            "delete_port_forward", ext_port=ext_port, proto=proto
         )
 
     async def set_qos_switch(self, on: int) -> dict:
@@ -571,9 +575,7 @@ class LuciClient:
 
         return await self._execute_api_action("qos_info")
 
-    async def set_qos(
-        self, mac: str, upload: int, download: int
-    ) -> dict:
+    async def set_qos(self, mac: str, upload: int, download: int) -> dict:
         """misystem/qos_limits method.
 
         :param mac: str: Device MAC address
@@ -656,9 +658,7 @@ class LuciClient:
         :return dict: dict with api data.
         """
 
-        return await self._execute_api_action(
-            "add_mesh_node", locate_ip=locate_ip
-        )
+        return await self._execute_api_action("add_mesh_node", locate_ip=locate_ip)
 
     async def wifi_macfilter_info(self) -> dict:
         """xqnetwork/wifi_macfilter_info method.
@@ -738,7 +738,10 @@ class LuciClient:
         :param is_only_log: bool: Is only log
         """
 
-        _LOGGER.debug("%s (%s): %s", message, url, str(content))
+        # Neither the URL (stok/query/password) nor raw payload/error text is
+        # safe for debug logs. Diagnostic bodies are redacted before storage.
+        endpoint = path.split("?", 1)[0]
+        _LOGGER.debug("%s (%s)", message, endpoint)
 
         if is_only_log:
             return
@@ -748,10 +751,12 @@ class LuciClient:
         try:
             _content = json.loads(content)
         except (ValueError, TypeError):
-            _content = str(content)
+            _content = {"response_type": type(content).__name__}
 
-        self.diagnostics[path] = {
+        from .privacy import redact
+
+        self.diagnostics[endpoint] = {
             DIAGNOSTIC_DATE_TIME: datetime.now().replace(microsecond=0).isoformat(),
             DIAGNOSTIC_MESSAGE: message,
-            DIAGNOSTIC_CONTENT: _content,
+            DIAGNOSTIC_CONTENT: redact(_content),
         }

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import logging
+import re
+from copy import deepcopy
 from ipaddress import IPv4Address
 from typing import Final
 
@@ -22,7 +23,6 @@ from .const import (
     ATTR_TRACKER_MAC_BOUND,
     ATTR_TRACKER_WAN,
     CONF_BODY,
-    CONF_CLEANUP_STALE_CLIENTS,
     CONF_REQUEST,
     CONF_RESPONSE,
     CONF_URI,
@@ -59,6 +59,8 @@ from .client_identity import (
     wan_authority,
 )
 from .exceptions import LuciError
+from .operations import OperationError, manager_for
+from .readback import bandwidth, port_rules, rule_matches
 from .updater import LuciUpdater, async_get_updater
 
 _LOGGER = logging.getLogger(__name__)
@@ -70,7 +72,8 @@ class MiWifiServiceCall:
     schema = vol.Schema(
         {
             vol.Required(CONF_DEVICE_ID): vol.All(
-                vol.Coerce(list),
+                lambda value: [value] if isinstance(value, str) else value,
+                list,
                 vol.Length(
                     min=1, max=1, msg="The service only supports one device per call."
                 ),
@@ -102,7 +105,18 @@ class MiWifiServiceCall:
 
         for connection_type, identifier in device.connections:
             if connection_type == CONF_IP_ADDRESS and len(identifier) > 0:
-                return async_get_updater(self.hass, identifier)
+                try:
+                    updater = async_get_updater(self.hass, identifier)
+                except ValueError as err:
+                    raise vol.Invalid("Selected router is not loaded") from err
+                router_mac = updater.data.get(ATTR_DEVICE_MAC_ADDRESS)
+                if router_mac and not any(
+                    kind == dr.CONNECTION_NETWORK_MAC
+                    and str(value).upper() == str(router_mac).upper()
+                    for kind, value in device.connections
+                ):
+                    raise vol.Invalid("Choose the MiWiFi router, not a tracked client")
+                return updater
 
         raise vol.Invalid(
             f"Device {device_id} does not support the called service. Choose a router with MiWifi support."  # pylint: disable=line-too-long
@@ -136,6 +150,17 @@ class MiWifiServiceCall:
         :param updater: LuciUpdater
         """
 
+        for key, record in manager_for(updater).records.items():
+            if ":" in key:
+                _, mac = key.split(":", 1)
+                if mac in updater.devices:
+                    updater.devices[mac].update(
+                        {
+                            "operation_status": record.status,
+                            "operation_id": record.request_id,
+                            "pending": record.status == "pending",
+                        }
+                    )
         updater._is_optimistic_tracker_update = True
         try:
             updater.async_set_updated_data(dict(updater.data))
@@ -172,11 +197,53 @@ class MiWifiServiceCall:
         :param delay: float
         """
 
-        async def _delayed_refresh() -> None:
-            await asyncio.sleep(delay)
-            await updater.async_request_refresh()
+        updater.schedule_followup_refresh(delay)
 
-        self.hass.async_create_task(_delayed_refresh())
+    async def _verified(
+        self,
+        updater,
+        key,
+        desired,
+        command,
+        read,
+        apply,
+        *,
+        matches=None,
+        optimistic=None,
+        preflight=None,
+    ):
+        try:
+            return await manager_for(updater).execute(
+                key,
+                desired,
+                command,
+                read,
+                apply,
+                lambda: self._publish_optimistic_update(updater),
+                matches=matches,
+                optimistic=optimistic,
+                preflight=preflight,
+            )
+        except OperationError as err:
+            raise vol.Invalid(str(err)) from err
+        finally:
+            self._schedule_router_refresh(updater)
+
+    async def _acknowledged(self, updater, command) -> dict:
+        """Experimental APIs without a known read-back never return verified."""
+        try:
+            async with manager_for(updater).lock:
+                await command()
+            _LOGGER.warning(
+                "Router acknowledged an experimental action; applied state is not verified"
+            )
+            return {"acknowledged": True, "verified": False}
+        except (LuciError, ValueError) as err:
+            raise vol.Invalid(
+                "Router acknowledgement unavailable; command was not retried"
+            ) from err
+        finally:
+            self._schedule_router_refresh(updater)
 
 
 class MiWifiCalcPasswdServiceCall(MiWifiServiceCall):
@@ -228,11 +295,28 @@ class MiWifiRequestServiceCall(MiWifiServiceCall):
         _data: dict = dict(service.data)
 
         try:
-            response: dict = await updater.luci.get(
-                uri := _data.get(CONF_URI), body := _data.get(CONF_BODY, {})  # type: ignore
-            )
-        except LuciError:
-            return
+            # The raw request action is read-only. It must not bypass validation,
+            # serialization or reconciliation of the dedicated control actions.
+            uri = _data.get(CONF_URI, "")
+            body = _data.get(CONF_BODY, {})
+            readonly = {
+                schema["endpoint"]
+                for name, schema in MIWIFI_API_MAP.items()
+                if schema["method"] == "GET"
+                and name
+                not in {
+                    "set_wifi",
+                    "set_guest_wifi",
+                    "rom_upgrade",
+                    "reboot",
+                    "flash_permission",
+                }
+            }
+            if uri not in readonly or (uri == "misystem/led" and body):
+                raise vol.Invalid("Use a dedicated action for router changes")
+            response: dict = await updater.luci.get(uri, body)
+        except LuciError as err:
+            raise vol.Invalid("Router read failed") from err
 
         device: dr.DeviceEntry | None = dr.async_get(self.hass).async_get_device(
             set(),
@@ -277,28 +361,30 @@ class MiWifiSetMacFilterServiceCall(MiWifiServiceCall):
         mac: str = _data.get(CONF_MAC, "")
         wan: int = int(_data.get(CONF_WAN, 0))
 
-        try:
-            # Verify identity against router data BEFORE writing, not a stale tracker.
-            current = wan_authority(await updater.luci.device_list(), mac)
+        changed = False
+
+        async def read():
+            return wan_authority(await updater.luci.device_list(), mac)
+
+        def preflight(current):
+            nonlocal changed
             changed = current != wan
-            if changed:
-                await updater.luci.set_mac_filter(mac, wan)
-                for attempt in range(3):
-                    actual = wan_authority(await updater.luci.device_list(), mac)
-                    if actual == wan:
-                        break
-                    if attempt < 2:
-                        await asyncio.sleep(1)
-                if actual != wan:
-                    raise ValueError("Router did not confirm requested WAN authority")
-            self._set_optimistic_tracker_value(updater, mac, ATTR_TRACKER_WAN, wan)
-            return {"mac": mac, "wan": wan, "verified": True, "changed": changed}
-        except (LuciError, ValueError) as _e:
-            raise vol.Invalid(
-                f"Failed to set MAC filter for {mac}: {_e}"
-            ) from _e
-        finally:
-            self._schedule_router_refresh(updater)
+
+        def apply(actual):
+            if mac in updater.devices:
+                updater.devices[mac][ATTR_TRACKER_WAN] = actual
+
+        await self._verified(
+            updater,
+            f"wan:{mac}",
+            wan,
+            lambda: updater.luci.set_mac_filter(mac, wan),
+            read,
+            apply,
+            optimistic=lambda: apply(wan),
+            preflight=preflight,
+        )
+        return {"mac": mac, "wan": wan, "verified": True, "changed": changed}
 
 
 class MiWifiClientStatusServiceCall(MiWifiServiceCall):
@@ -310,8 +396,11 @@ class MiWifiClientStatusServiceCall(MiWifiServiceCall):
     async def async_call_service(self, service: ServiceCall) -> dict:
         updater = self.get_updater(service)
         try:
-            return client_status(await updater.luci.device_list(),
-                                 await updater.luci.macbind_info(), service.data[CONF_MAC])
+            return client_status(
+                await updater.luci.device_list(),
+                await updater.luci.macbind_info(),
+                service.data[CONF_MAC],
+            )
         except (LuciError, ValueError) as err:
             raise vol.Invalid("Client status cannot be verified") from err
 
@@ -332,6 +421,33 @@ CONF_LOCATE_IP: Final = "locate_ip"
 CONF_MODEL: Final = "model"
 CONF_IP: Final = "ip"
 CONF_DAYS_OVERRIDE: Final = "days"
+
+
+def schedule_time(value):
+    if not isinstance(value, str) or not re.fullmatch(
+        r"(?:[01]\d|2[0-3]):[0-5]\d", value
+    ):
+        raise ValueError("Expected time HH:MM")
+    return value
+
+
+def schedule_days(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[1-7](?:,[1-7])*", value):
+        raise ValueError("Expected comma-separated weekdays 1..7")
+    days = value.split(",")
+    if len(days) != len(set(days)):
+        raise ValueError("Duplicate weekday")
+    return ",".join(sorted(days))
+
+
+def wifi_mac_list(value):
+    if value == "":
+        return value
+    if not isinstance(value, str):
+        raise ValueError("Expected semicolon-separated MAC addresses")
+    return ";".join(
+        dict.fromkeys(client_mac(item.strip()) for item in value.split(";"))
+    )
 
 
 class _MiWifiDataServiceCall(MiWifiServiceCall):
@@ -384,6 +500,7 @@ class MiWifiMacbindInfoServiceCall(_MiWifiDataServiceCall):
 
 _PROTO_MAP = {"tcp": 1, "udp": 2, "both": 3}
 
+
 class MiWifiPortForwardListServiceCall(_MiWifiDataServiceCall):
     """List port forwarding rules."""
 
@@ -398,9 +515,13 @@ class MiWifiAddPortForwardServiceCall(MiWifiServiceCall):
         {
             vol.Required(CONF_NAME): str,
             vol.Required(CONF_PROTO): vol.In(["tcp", "udp", "both"]),
-            vol.Required(CONF_FWD_IP): str,
-            vol.Required(CONF_FWD_PORT): vol.All(vol.Coerce(int), vol.Range(min=1, max=65535)),
-            vol.Required(CONF_EXT_PORT): vol.All(vol.Coerce(int), vol.Range(min=1, max=65535)),
+            vol.Required(CONF_FWD_IP): lambda value: str(IPv4Address(value)),
+            vol.Required(CONF_FWD_PORT): vol.All(
+                vol.Coerce(int), vol.Range(min=1, max=65535)
+            ),
+            vol.Required(CONF_EXT_PORT): vol.All(
+                vol.Coerce(int), vol.Range(min=1, max=65535)
+            ),
         }
     )
 
@@ -412,7 +533,15 @@ class MiWifiAddPortForwardServiceCall(MiWifiServiceCall):
 
         proto_int = _PROTO_MAP.get(_data[CONF_PROTO], 1)
 
-        try:
+        desired = {
+            "name": _data[CONF_NAME],
+            "proto": proto_int,
+            "destip": _data[CONF_FWD_IP],
+            "destport": str(_data[CONF_FWD_PORT]),
+            "srcport": str(_data[CONF_EXT_PORT]),
+        }
+
+        async def command():
             await updater.luci.add_port_forward(
                 name=_data[CONF_NAME],
                 proto=proto_int,
@@ -422,23 +551,42 @@ class MiWifiAddPortForwardServiceCall(MiWifiServiceCall):
                 ext_port=int(_data[CONF_EXT_PORT]),
             )
 
-            if ATTR_PORT_FORWARD not in updater.data:
-                updater.data[ATTR_PORT_FORWARD] = []
+        async def read():
+            return port_rules(await updater.luci.port_forward_list())
 
-            updater.data[ATTR_PORT_FORWARD].append({
-                "name": _data[CONF_NAME],
-                "proto": proto_int,
-                "destip": _data[CONF_FWD_IP],
-                "destport": str(_data[CONF_FWD_PORT]),
-                "srcport": str(_data[CONF_EXT_PORT]),
-            })
+        def matches(actual, target):
+            return any(
+                rule_matches(
+                    rule,
+                    proto=proto_int,
+                    port=int(_data[CONF_EXT_PORT]),
+                    ip=_data[CONF_FWD_IP],
+                    dest_port=int(_data[CONF_FWD_PORT]),
+                    name=_data[CONF_NAME],
+                )
+                for rule in actual
+            )
 
-            self._publish_optimistic_update(updater)
+        def preflight(actual):
+            if not matches(actual, desired) and any(
+                rule_matches(rule, proto=proto_int, port=int(_data[CONF_EXT_PORT]))
+                for rule in actual
+            ):
+                raise ValueError("A different rule already uses this external port")
 
-        except LuciError as _e:
-            raise vol.Invalid(
-                f"Failed to add port forward rule: {_e}"
-            ) from _e
+        await self._verified(
+            updater,
+            "port_forward",
+            desired,
+            command,
+            read,
+            lambda actual: updater.data.update({ATTR_PORT_FORWARD: deepcopy(actual)}),
+            matches=matches,
+            preflight=preflight,
+            optimistic=lambda: updater.data.update(
+                {ATTR_PORT_FORWARD: [*updater.data.get(ATTR_PORT_FORWARD, []), desired]}
+            ),
+        )
 
 
 class MiWifiDeletePortForwardServiceCall(MiWifiServiceCall):
@@ -447,7 +595,9 @@ class MiWifiDeletePortForwardServiceCall(MiWifiServiceCall):
     schema = MiWifiServiceCall.schema.extend(
         {
             vol.Required(CONF_PROTO): vol.In(["tcp", "udp", "both"]),
-            vol.Required(CONF_EXT_PORT): vol.All(vol.Coerce(int), vol.Range(min=1, max=65535)),
+            vol.Required(CONF_EXT_PORT): vol.All(
+                vol.Coerce(int), vol.Range(min=1, max=65535)
+            ),
         }
     )
 
@@ -460,24 +610,39 @@ class MiWifiDeletePortForwardServiceCall(MiWifiServiceCall):
         proto_int = _PROTO_MAP.get(_data[CONF_PROTO], 1)
         ext_port_to_del = int(_data[CONF_EXT_PORT])
 
-        try:
+        async def command():
             await updater.luci.delete_port_forward(
                 proto=proto_int,
                 ext_port=int(_data[CONF_EXT_PORT]),
             )
 
-            if ATTR_PORT_FORWARD in updater.data:
-                updater.data[ATTR_PORT_FORWARD] = [
-                    rule for rule in updater.data[ATTR_PORT_FORWARD]
-                    if not (int(rule.get("srcport", 0)) == ext_port_to_del and int(rule.get("proto", 1)) == proto_int)
-                ]
+        async def read():
+            return port_rules(await updater.luci.port_forward_list())
 
-            self._publish_optimistic_update(updater)
+        def matches(actual, target):
+            return not any(
+                rule_matches(rule, proto=proto_int, port=ext_port_to_del)
+                for rule in actual
+            )
 
-        except LuciError as _e:
-            raise vol.Invalid(
-                f"Failed to delete port forward rule: {_e}"
-            ) from _e
+        await self._verified(
+            updater,
+            "port_forward",
+            None,
+            command,
+            read,
+            lambda actual: updater.data.update({ATTR_PORT_FORWARD: deepcopy(actual)}),
+            matches=matches,
+            optimistic=lambda: updater.data.update(
+                {
+                    ATTR_PORT_FORWARD: [
+                        rule
+                        for rule in updater.data.get(ATTR_PORT_FORWARD, [])
+                        if not rule_matches(rule, proto=proto_int, port=ext_port_to_del)
+                    ]
+                }
+            ),
+        )
 
 
 class MiWifiSetBandServiceCall(MiWifiServiceCall):
@@ -492,13 +657,26 @@ class MiWifiSetBandServiceCall(MiWifiServiceCall):
 
     async def async_call_service(self, service: ServiceCall) -> None:
         updater: LuciUpdater = self.get_updater(service)
-        try:
-            await updater.luci.set_band(
-                upload=int(service.data[CONF_UPLOAD]),
-                download=int(service.data[CONF_DOWNLOAD]),
+        desired = (int(service.data[CONF_UPLOAD]), int(service.data[CONF_DOWNLOAD]))
+
+        async def read():
+            return bandwidth(await updater.luci.qos_info())
+
+        def apply(actual):
+            updater.data.update(
+                {"qos_band_up": int(actual[0]), "qos_band_down": int(actual[1])}
             )
-        except LuciError as _e:
-            raise vol.Invalid(f"Failed to set global bandwidth: {_e}") from _e
+
+        await self._verified(
+            updater,
+            "qos_band",
+            desired,
+            lambda: updater.luci.set_band(upload=desired[0], download=desired[1]),
+            read,
+            apply,
+            optimistic=lambda: apply(desired),
+        )
+
 
 class MiWifiQosInfoServiceCall(_MiWifiDataServiceCall):
     """Get QoS information."""
@@ -514,7 +692,7 @@ class MiWifiSetQosServiceCall(MiWifiServiceCall):
 
     schema = MiWifiServiceCall.schema.extend(
         {
-            vol.Required(CONF_MAC): str,
+            vol.Required(CONF_MAC): client_mac,
             vol.Required(CONF_UPLOAD): vol.All(vol.Coerce(int), vol.Range(min=0)),
             vol.Required(CONF_DOWNLOAD): vol.All(vol.Coerce(int), vol.Range(min=0)),
         }
@@ -526,20 +704,34 @@ class MiWifiSetQosServiceCall(MiWifiServiceCall):
         updater: LuciUpdater = self.get_updater(service)
         _data: dict = dict(service.data)
 
-        try:
-            await updater.luci.set_qos(
-                mac=_data[CONF_MAC],
-                upload=int(_data[CONF_UPLOAD]),
-                download=int(_data[CONF_DOWNLOAD]),
-            )
-        except LuciError as _e:
-            raise vol.Invalid(
-                f"Failed to set QoS for {_data[CONF_MAC]}: {_e}"
-            ) from _e
+        mac = _data[CONF_MAC]
+        desired = (int(_data[CONF_UPLOAD]), int(_data[CONF_DOWNLOAD]))
+
+        async def read():
+            return bandwidth(await updater.luci.qos_info(), mac)
+
+        def apply(actual):
+            if mac in updater.devices:
+                updater.devices[mac].update(
+                    {"qos_up": int(actual[0]), "qos_down": int(actual[1])}
+                )
+
+        await self._verified(
+            updater,
+            f"qos:{mac}",
+            desired,
+            lambda: updater.luci.set_qos(
+                mac=mac, upload=desired[0], download=desired[1]
+            ),
+            read,
+            apply,
+            optimistic=lambda: apply(desired),
+        )
 
 
 class MiWifiMacBindServiceCall(MiWifiServiceCall):
     """Bind IP to MAC address."""
+
     supports_response = True
 
     schema = MiWifiServiceCall.schema.extend(
@@ -560,34 +752,75 @@ class MiWifiMacBindServiceCall(MiWifiServiceCall):
         ip_to_bind = _data[CONF_IP]
         name_to_bind = _data[CONF_NAME]
 
-        try:
-            original_response = await updater.luci.macbind_info()
-            validate_binding_target(original_response, mac_to_bind, ip_to_bind)
-            original = binding_snapshot(original_response)
+        original = None
+
+        async def read():
+            response = await updater.luci.macbind_info()
+            binding_snapshot(response)
+            return response
+
+        def preflight(response):
+            nonlocal original
+            original = binding_snapshot(response)
+            validate_binding_target(response, mac_to_bind, ip_to_bind)
+
+        def matches(response, target):
+            snapshot = binding_snapshot(response)
+            unaffected = {
+                mac: value for mac, value in snapshot.items() if mac != mac_to_bind
+            }
+            if original is not None and unaffected != {
+                mac: value for mac, value in original.items() if mac != mac_to_bind
+            }:
+                raise ValueError("Unrelated DHCP reservations changed")
+            return (
+                snapshot.get(mac_to_bind, {}).get("bound_ip") == ip_to_bind
+                and snapshot.get(mac_to_bind, {}).get("bound_name") == name_to_bind
+            )
+
+        async def command():
             await updater.luci.mac_bind(
                 ip=ip_to_bind,
                 mac=mac_to_bind,
                 name=name_to_bind,
             )
-            bindings = binding_snapshot(await updater.luci.macbind_info())
-            if {mac: value for mac, value in original.items() if mac != mac_to_bind} != {
-                mac: value for mac, value in bindings.items() if mac != mac_to_bind
-            }:
-                raise ValueError("Unrelated reservations changed; inspect the router before further writes")
-            if bindings.get(mac_to_bind, {}).get('bound_ip') != ip_to_bind:
-                raise ValueError("Router did not confirm the reservation")
+
+        def apply(response):
+            bindings = binding_snapshot(response)
             for device_mac, device in updater.devices.items():
-                device.update(binding_attributes(bindings, device_mac, device.get('ip')))
-            self._publish_optimistic_update(updater)
-            return {"mac": mac_to_bind, "bound_ip": ip_to_bind, "verified": True}
-        except (LuciError, ValueError) as _e:
-            raise vol.Invalid(f"MAC binding not confirmed for {mac_to_bind}: {_e}") from _e
-        finally:
-            self._schedule_router_refresh(updater)
+                device.update(
+                    binding_attributes(bindings, device_mac, device.get("ip"))
+                )
+
+        def optimistic():
+            predicted = dict(original)
+            predicted[mac_to_bind] = {
+                "bound_ip": ip_to_bind,
+                "bound_name": name_to_bind,
+                "binding_source": "reservation_list",
+            }
+            for device_mac, device in updater.devices.items():
+                device.update(
+                    binding_attributes(predicted, device_mac, device.get("ip"))
+                )
+
+        await self._verified(
+            updater,
+            f"binding:{mac_to_bind}",
+            ip_to_bind,
+            command,
+            read,
+            apply,
+            matches=matches,
+            preflight=preflight,
+            optimistic=optimistic,
+        )
+        return {"mac": mac_to_bind, "bound_ip": ip_to_bind, "verified": True}
 
 
 class MiWifiMacUnbindServiceCall(MiWifiServiceCall):
     """Remove MAC binding."""
+
     supports_response = True
 
     schema = MiWifiServiceCall.schema.extend(
@@ -603,30 +836,58 @@ class MiWifiMacUnbindServiceCall(MiWifiServiceCall):
         _data: dict = dict(service.data)
         mac_to_unbind = _data[CONF_MAC]
 
-        try:
-            original = binding_snapshot(await updater.luci.macbind_info())
-            await updater.luci.mac_unbind(mac_to_unbind)
-            bindings = binding_snapshot(await updater.luci.macbind_info())
-            if {mac: value for mac, value in original.items() if mac != mac_to_unbind} != bindings:
-                raise ValueError("Unrelated reservations changed or target remains; inspect the router")
-            if mac_to_unbind in bindings:
-                raise ValueError("Router still reports the reservation")
+        original = None
+
+        async def read():
+            return binding_snapshot(await updater.luci.macbind_info())
+
+        def preflight(snapshot):
+            nonlocal original
+            original = snapshot
+
+        def matches(snapshot, target):
+            if original is not None and {
+                mac: value for mac, value in snapshot.items() if mac != mac_to_unbind
+            } != {
+                mac: value for mac, value in original.items() if mac != mac_to_unbind
+            }:
+                raise ValueError("Unrelated DHCP reservations changed")
+            return mac_to_unbind not in snapshot
+
+        def apply(bindings):
             for device_mac, device in updater.devices.items():
-                device.update(binding_attributes(bindings, device_mac, device.get('ip')))
-            self._publish_optimistic_update(updater)
-            return {"mac": mac_to_unbind, "verified": True, "mac_bound": False}
-        except (LuciError, ValueError) as _e:
-            raise vol.Invalid(f"MAC unbinding not confirmed for {mac_to_unbind}: {_e}") from _e
-        finally:
-            self._schedule_router_refresh(updater)
+                device.update(
+                    binding_attributes(bindings, device_mac, device.get("ip"))
+                )
+
+        await self._verified(
+            updater,
+            f"binding:{mac_to_unbind}",
+            None,
+            lambda: updater.luci.mac_unbind(mac_to_unbind),
+            read,
+            apply,
+            matches=matches,
+            preflight=preflight,
+            optimistic=lambda: apply(
+                {mac: value for mac, value in original.items() if mac != mac_to_unbind}
+            ),
+        )
+        return {"mac": mac_to_unbind, "verified": True, "mac_bound": False}
 
 
 class MiWifiCleanupStaleClientsServiceCall(MiWifiServiceCall):
     """Remove stale router clients from HA and integration storage."""
 
+    supports_response = True
+
     schema = MiWifiServiceCall.schema.extend(
         {
-            vol.Optional(CONF_DAYS_OVERRIDE): vol.All(vol.Coerce(int), vol.Range(min=1)),
+            vol.Optional(CONF_DAYS_OVERRIDE): vol.All(
+                vol.Coerce(int), vol.Range(min=1)
+            ),
+            vol.Optional("dry_run", default=True): bool,
+            vol.Optional("confirm", default=False): bool,
         }
     )
 
@@ -636,12 +897,23 @@ class MiWifiCleanupStaleClientsServiceCall(MiWifiServiceCall):
         updater: LuciUpdater = self.get_updater(service)
         days: int | None = dict(service.data).get(CONF_DAYS_OVERRIDE)
 
-        result = await updater.async_cleanup_stale_clients(days)
+        dry_run = service.data.get("dry_run", True)
+        if not dry_run and not service.data.get("confirm", False):
+            raise vol.Invalid(
+                "Preview cleanup first, then set dry_run=false and confirm=true"
+            )
+        try:
+            result = await updater.async_cleanup_stale_clients(days, dry_run=dry_run)
+        except (LuciError, ValueError) as err:
+            raise vol.Invalid(
+                "Cleanup cancelled: client and reservation state cannot be verified"
+            ) from err
 
         pn.async_create(
             self.hass,
             (
-                "Removed stale MiWiFi clients: "
+                f"MiWiFi cleanup {'preview' if dry_run else 'completed'}: "
+                f"candidates={len(result['candidates'])}, "
                 f"clients={result['removed_clients']}, "
                 f"devices={result['removed_devices']}, "
                 f"entities={result['removed_entities']}, "
@@ -649,6 +921,7 @@ class MiWifiCleanupStaleClientsServiceCall(MiWifiServiceCall):
             ),
             f"{NAME}: cleanup stale clients",
         )
+        return result
 
 
 class MiWifiWifiTimerInfoServiceCall(_MiWifiDataServiceCall):
@@ -663,12 +936,16 @@ class MiWifiWifiTimerInfoServiceCall(_MiWifiDataServiceCall):
 class MiWifiSetWifiTimerServiceCall(MiWifiServiceCall):
     """Set global WiFi transmitter schedule."""
 
+    supports_response = True
+
     schema = MiWifiServiceCall.schema.extend(
         {
-            vol.Required(CONF_START_TIME): str,
-            vol.Required(CONF_END_TIME): str,
-            vol.Required(CONF_DAYS): str,
-            vol.Optional(CONF_ENABLED, default=1): vol.All(vol.Coerce(int), vol.In([0, 1])),
+            vol.Required(CONF_START_TIME): schedule_time,
+            vol.Required(CONF_END_TIME): schedule_time,
+            vol.Required(CONF_DAYS): schedule_days,
+            vol.Optional(CONF_ENABLED, default=1): vol.All(
+                vol.Coerce(int), vol.In([0, 1])
+            ),
         }
     )
 
@@ -678,29 +955,34 @@ class MiWifiSetWifiTimerServiceCall(MiWifiServiceCall):
         updater: LuciUpdater = self.get_updater(service)
         _data: dict = dict(service.data)
 
-        try:
-            await updater.luci.set_wifi_timer(
+        async def command():
+            # Probe the advertised read endpoint before submitting a schedule.
+            # Unsupported firmware must not silently accept a guessed write.
+            await updater.luci.wifi_timer_info()
+            return await updater.luci.set_wifi_timer(
                 start_time=_data[CONF_START_TIME],
                 end_time=_data[CONF_END_TIME],
                 days=_data[CONF_DAYS],
                 enabled=int(_data.get(CONF_ENABLED, 1)),
             )
-        except LuciError as _e:
-            raise vol.Invalid(
-                f"Failed to set WiFi timer: {_e}"
-            ) from _e
+
+        return await self._acknowledged(updater, command)
 
 
 class MiWifiSetMacTimeServiceCall(MiWifiServiceCall):
     """Set per-device internet access schedule (parental control)."""
 
+    supports_response = True
+
     schema = MiWifiServiceCall.schema.extend(
         {
-            vol.Required(CONF_MAC): str,
-            vol.Required(CONF_START_TIME): str,
-            vol.Required(CONF_END_TIME): str,
-            vol.Required(CONF_DAYS): str,
-            vol.Optional(CONF_ENABLED, default=1): vol.All(vol.Coerce(int), vol.In([0, 1])),
+            vol.Required(CONF_MAC): client_mac,
+            vol.Required(CONF_START_TIME): schedule_time,
+            vol.Required(CONF_END_TIME): schedule_time,
+            vol.Required(CONF_DAYS): schedule_days,
+            vol.Optional(CONF_ENABLED, default=1): vol.All(
+                vol.Coerce(int), vol.In([0, 1])
+            ),
         }
     )
 
@@ -710,26 +992,27 @@ class MiWifiSetMacTimeServiceCall(MiWifiServiceCall):
         updater: LuciUpdater = self.get_updater(service)
         _data: dict = dict(service.data)
 
-        try:
-            await updater.luci.set_mac_time(
+        async def command():
+            wan_authority(await updater.luci.device_list(), _data[CONF_MAC])
+            return await updater.luci.set_mac_time(
                 mac=_data[CONF_MAC],
                 start_time=_data[CONF_START_TIME],
                 end_time=_data[CONF_END_TIME],
                 days=_data[CONF_DAYS],
                 enabled=int(_data.get(CONF_ENABLED, 1)),
             )
-        except LuciError as _e:
-            raise vol.Invalid(
-                f"Failed to set parental control for {_data[CONF_MAC]}: {_e}"
-            ) from _e
+
+        return await self._acknowledged(updater, command)
 
 
 class MiWifiAddMeshNodeServiceCall(MiWifiServiceCall):
     """Add a mesh node."""
 
+    supports_response = True
+
     schema = MiWifiServiceCall.schema.extend(
         {
-            vol.Required(CONF_LOCATE_IP): str,
+            vol.Required(CONF_LOCATE_IP): lambda value: str(IPv4Address(value)),
         }
     )
 
@@ -739,14 +1022,9 @@ class MiWifiAddMeshNodeServiceCall(MiWifiServiceCall):
         updater: LuciUpdater = self.get_updater(service)
         _data: dict = dict(service.data)
 
-        try:
-            await updater.luci.add_mesh_node(
-                locate_ip=_data[CONF_LOCATE_IP],
-            )
-        except LuciError as _e:
-            raise vol.Invalid(
-                f"Failed to add mesh node: {_e}"
-            ) from _e
+        return await self._acknowledged(
+            updater, lambda: updater.luci.add_mesh_node(locate_ip=_data[CONF_LOCATE_IP])
+        )
 
 
 class MiWifiSetWifiMacfilterServiceCall(MiWifiServiceCall):
@@ -756,10 +1034,12 @@ class MiWifiSetWifiMacfilterServiceCall(MiWifiServiceCall):
     Different from MiWifiSetMacFilterServiceCall which controls WAN access.
     """
 
+    supports_response = True
+
     schema = MiWifiServiceCall.schema.extend(
         {
             vol.Required(CONF_MODEL): vol.All(vol.Coerce(int), vol.In([0, 1, 2])),
-            vol.Required(CONF_MAC): str,
+            vol.Required(CONF_MAC): wifi_mac_list,
         }
     )
 
@@ -771,15 +1051,44 @@ class MiWifiSetWifiMacfilterServiceCall(MiWifiServiceCall):
         model: int = int(_data.get(CONF_MODEL, 0))
         mac: str = _data.get(CONF_MAC, "")
 
-        try:
-            await updater.luci.set_wifi_macfilter(model, mac)
-        except LuciError as _e:
-            raise vol.Invalid(
-                f"Failed to set WiFi MAC filter: {_e}"
-            ) from _e
+        return await self._acknowledged(
+            updater, lambda: updater.luci.set_wifi_macfilter(model, mac)
+        )
+
+
+class MiWifiCapabilitiesServiceCall(MiWifiServiceCall):
+    """Read-only feature discovery for the frontend; no firmware assumptions."""
+
+    supports_response = True
+
+    async def async_call_service(self, service: ServiceCall) -> dict:
+        updater = self.get_updater(service)
+        features = {}
+        async with manager_for(updater).lock:
+            for name, reader in (
+                ("wifi_schedule", updater.luci.wifi_timer_info),
+                ("qos", updater.luci.qos_info),
+                ("port_forward", updater.luci.port_forward_list),
+                ("dhcp_reservations", updater.luci.macbind_info),
+            ):
+                try:
+                    await reader()
+                    features[name] = {"read_supported": True}
+                except LuciError:
+                    features[name] = {"read_supported": False}
+        return {
+            "features": features,
+            "experimental_actions": [
+                "set_wifi_timer",
+                "set_mac_time",
+                "add_mesh_node",
+                "set_wifi_macfilter",
+            ],
+        }
 
 
 SERVICES: Final = (
+    ("get_capabilities", MiWifiCapabilitiesServiceCall),
     (SERVICE_CALC_PASSWD, MiWifiCalcPasswdServiceCall),
     (SERVICE_REQUEST, MiWifiRequestServiceCall),
     (SERVICE_SET_MAC_FILTER, MiWifiSetMacFilterServiceCall),
@@ -791,7 +1100,7 @@ SERVICES: Final = (
     (SERVICE_PORT_FORWARD_LIST, MiWifiPortForwardListServiceCall),
     (SERVICE_ADD_PORT_FORWARD, MiWifiAddPortForwardServiceCall),
     (SERVICE_DELETE_PORT_FORWARD, MiWifiDeletePortForwardServiceCall),
-    (SERVICE_SET_BAND, MiWifiSetBandServiceCall),   
+    (SERVICE_SET_BAND, MiWifiSetBandServiceCall),
     (SERVICE_QOS_INFO, MiWifiQosInfoServiceCall),
     (SERVICE_SET_QOS, MiWifiSetQosServiceCall),
     (SERVICE_WIFI_TIMER_INFO, MiWifiWifiTimerInfoServiceCall),

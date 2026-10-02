@@ -18,7 +18,7 @@ jobs:
           python-version: "3.14"
       - run: pip install "homeassistant==2026.9.4" aiohttp_cors aiodiscover scapy async_upnp_client
       - run: python -m compileall -q custom_components/miwifi
-      - run: python -m unittest tests.test_client_identity
+      - run: python -m unittest tests.test_client_identity tests.test_backend_safety
 
   codeql:
     runs-on: ubuntu-latest

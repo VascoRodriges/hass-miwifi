@@ -42,7 +42,7 @@
           "stay_online": "Minimum stay online in seconds",
           "scan_interval": "Scan interval in seconds [PRO]",
           "activity_days": "Allowed number of days to wait after the last activity [PRO]",
-          "cleanup_stale_clients": "Remove stale clients now",
+          "cleanup_stale_clients": "Preview stale clients (does not delete)",
           "timeout": "Timeout of requests in seconds [PRO]",
           "is_force_load": "Forced booting of devices in repeater mode [PRO]"
         }

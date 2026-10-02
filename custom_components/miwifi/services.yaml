@@ -10,7 +10,7 @@ calc_passwd:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
 
 request:
   name: Send request
@@ -24,7 +24,7 @@ request:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
     uri:
       name: Uri
       description: Request uri.
@@ -53,7 +53,7 @@ set_mac_filter:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
     mac:
       name: MAC address
       description: MAC address of the device to block or unblock.
@@ -86,7 +86,7 @@ get_client_status:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
     mac:
       name: MAC address
       required: true
@@ -106,7 +106,7 @@ macbind_info:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
 
 mac_bind:
   name: Bind MAC
@@ -120,7 +120,7 @@ mac_bind:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
     ip:
       name: IP address
       description: Client IP address to bind.
@@ -155,7 +155,7 @@ mac_unbind:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
     mac:
       name: MAC address
       description: Client MAC address to unbind.
@@ -166,7 +166,7 @@ mac_unbind:
 
 cleanup_stale_clients:
   name: Cleanup stale clients
-  description: Remove old router clients from the integration and Home Assistant registries.
+  description: Preview stale clients by default. Online, reserved and shared devices are protected. Actual removal requires dry_run=false and confirm=true.
   fields:
     device_id:
       name: Router
@@ -176,7 +176,7 @@ cleanup_stale_clients:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
     days:
       name: Days
       description: Override the stale age threshold in days. If omitted, the integration activity_days option is used.
@@ -187,6 +187,16 @@ cleanup_stale_clients:
           min: 1
           max: 3650
           mode: box
+    dry_run:
+      name: Preview only
+      default: true
+      selector:
+        boolean:
+    confirm:
+      name: Confirm removal
+      default: false
+      selector:
+        boolean:
 
 port_forward_list:
   name: Port forward list
@@ -200,7 +210,7 @@ port_forward_list:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
 
 add_port_forward:
   name: Add port forward
@@ -214,7 +224,7 @@ add_port_forward:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
     name:
       name: Rule name
       description: Name of the port forwarding rule.
@@ -276,7 +286,7 @@ delete_port_forward:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
     proto:
       name: Protocol
       description: Protocol of the rule.
@@ -314,7 +324,7 @@ qos_info:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
 
 set_qos:
   name: Set QoS
@@ -328,7 +338,7 @@ set_qos:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
     mac:
       name: MAC address
       description: MAC address of the device.
@@ -371,11 +381,11 @@ wifi_timer_info:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
 
 set_wifi_timer:
   name: Set WiFi timer
-  description: Set global WiFi transmitter schedule (turns WiFi on/off at specified times).
+  description: Experimental, firmware-dependent. Probes read support before writing; returns acknowledged=true, verified=false, not proof the schedule is applied.
   fields:
     device_id:
       name: Router
@@ -385,7 +395,7 @@ set_wifi_timer:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
     start_time:
       name: Start time
       description: Time when WiFi turns OFF (HH:MM).
@@ -422,7 +432,7 @@ set_wifi_timer:
 
 set_mac_time:
   name: Set parental control
-  description: Set per-device internet access schedule (parental control via misystem/set_mac_time).
+  description: Experimental, firmware-dependent parental control. Returns acknowledged=true, verified=false; applied schedules cannot currently be verified.
   fields:
     device_id:
       name: Router
@@ -432,7 +442,7 @@ set_mac_time:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
     mac:
       name: MAC address
       description: MAC address of the device to restrict.
@@ -476,7 +486,7 @@ set_mac_time:
 
 add_mesh_node:
   name: Add mesh node
-  description: Add a new mesh node to the network.
+  description: Experimental mesh pairing. Returns acknowledgement only, verified=false. Acknowledgement does not prove pairing completed.
   fields:
     device_id:
       name: Router
@@ -486,7 +496,7 @@ add_mesh_node:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
     locate_ip:
       name: Node IP
       description: IP address of the node to add to the mesh network.
@@ -497,7 +507,7 @@ add_mesh_node:
 
 set_wifi_macfilter:
   name: Set WiFi MAC filter
-  description: Configure the WiFi MAC filter mode and list of controlled devices (xqnetwork/set_wifi_macfilter).
+  description: Experimental router-wide WiFi filter; may disconnect clients. Returns acknowledgement only, verified=false. For verified client WAN control use set_mac_filter instead.
   fields:
     device_id:
       name: Router
@@ -507,7 +517,7 @@ set_wifi_macfilter:
         device:
           filter:
             - integration: miwifi
-          multiple: true
+          multiple: false
     model:
       name: Filter mode
       description: "0 - disabled, 1 - blacklist (deny listed MACs), 2 - whitelist (allow only listed MACs)."
@@ -529,3 +539,45 @@ set_wifi_macfilter:
       example: "00:00:00:00:00:00"
       selector:
         text:
+
+get_capabilities:
+  name: Read router capabilities
+  description: Probe read support for schedules, QoS, port forwarding and DHCP reservations. Does not change router settings.
+  fields:
+    device_id:
+      name: Router
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: false
+
+set_band:
+  name: Set global WAN bandwidth
+  description: Set global QoS bandwidth and verify values directly from the router.
+  fields:
+    device_id:
+      name: Router
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: false
+    upload:
+      name: Upload bandwidth
+      required: true
+      selector:
+        number:
+          min: 1
+          mode: box
+          unit_of_measurement: Mbps
+    download:
+      name: Download bandwidth
+      required: true
+      selector:
+        number:
+          min: 1
+          mode: box
+          unit_of_measurement: Mbps

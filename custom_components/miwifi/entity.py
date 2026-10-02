@@ -5,11 +5,13 @@ from __future__ import annotations
 import logging
 
 from homeassistant.helpers.entity import EntityDescription
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import ATTR_DEVICE_MAC_ADDRESS, ATTR_STATE, ATTRIBUTION
 from .helper import generate_entity_id
 from .updater import LuciUpdater
+from .operations import OperationError, manager_for
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -63,7 +65,45 @@ class MiWifiEntity(CoordinatorEntity):
         :return bool: Is available
         """
 
-        return self._attr_available and self.coordinator.last_update_success
+        record = manager_for(self._updater).records.get(self.entity_description.key)
+        return (
+            self._attr_available
+            and self.coordinator.last_update_success
+            and (record is None or record.status != "unknown")
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        record = manager_for(self._updater).records.get(self.entity_description.key)
+        if record is None:
+            return {}
+        return {
+            "operation_status": record.status,
+            "operation_id": record.request_id,
+            "pending": record.status == "pending",
+        }
+
+    def _control_pending(self) -> bool:
+        record = manager_for(self._updater).records.get(self.entity_description.key)
+        return record is not None and record.status == "pending"
+
+    async def _verified_control(self, desired, command, apply) -> None:
+        """Optimistic state, authoritative read-back and exact rollback."""
+        key = self.entity_description.key
+        try:
+            await manager_for(self._updater).execute(
+                key,
+                desired,
+                command,
+                lambda: self._updater.read_control(key),
+                apply,
+                self.async_write_ha_state,
+                optimistic=lambda: apply(desired),
+            )
+        except OperationError as err:
+            raise HomeAssistantError(str(err)) from err
+        finally:
+            self._updater.schedule_followup_refresh()
 
     def _handle_coordinator_update(self) -> None:
         """Update state."""

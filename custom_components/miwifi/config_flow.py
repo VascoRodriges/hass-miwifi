@@ -1,6 +1,5 @@
 """Configuration flows."""
 
-
 from __future__ import annotations
 
 import contextlib
@@ -268,7 +267,9 @@ class MiWifiOptionsFlow(config_entries.OptionsFlow):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            cleanup_stale_clients = bool(user_input.get(CONF_CLEANUP_STALE_CLIENTS, False))
+            cleanup_stale_clients = bool(
+                user_input.get(CONF_CLEANUP_STALE_CLIENTS, False)
+            )
 
             code: codes = await async_verify_access(
                 self.hass,
@@ -292,7 +293,8 @@ class MiWifiOptionsFlow(config_entries.OptionsFlow):
                         pn.async_create(
                             self.hass,
                             (
-                                "Removed stale MiWiFi clients: "
+                                "MiWiFi cleanup preview (nothing removed): "
+                                f"candidates={len(result['candidates'])}, "
                                 f"clients={result['removed_clients']}, "
                                 f"devices={result['removed_devices']}, "
                                 f"entities={result['removed_entities']}, "

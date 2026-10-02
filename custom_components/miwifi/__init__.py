@@ -21,7 +21,6 @@ from .const import (
     CONF_ENCRYPTION_ALGORITHM,
     CONF_IS_FORCE_LOAD,
     DEFAULT_ACTIVITY_DAYS,
-    DEFAULT_CALL_DELAY,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_SLEEP,
     DEFAULT_TIMEOUT,
@@ -108,15 +107,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         await _updater.async_stop()
 
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, async_stop)
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, async_stop)
+    )
 
     for service_name, service in SERVICES:
-        if not hass.services.has_service(DOMAIN, service_name):
-            hass.services.async_register(
-                DOMAIN, service_name, service(hass).async_call_service, service.schema,
-                supports_response=SupportsResponse.OPTIONAL
-                if getattr(service, 'supports_response', False) else SupportsResponse.NONE,
-            )
+        hass.services.async_register(
+            DOMAIN,
+            service_name,
+            service(hass).async_call_service,
+            service.schema,
+            supports_response=SupportsResponse.OPTIONAL
+            if getattr(service, "supports_response", False)
+            else SupportsResponse.NONE,
+        )
 
     return True
 
@@ -152,6 +156,12 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _update_listener()
 
         hass.data[DOMAIN].pop(entry.entry_id)
+        if not any(
+            isinstance(value, dict) and UPDATER in value
+            for value in hass.data[DOMAIN].values()
+        ):
+            for service_name, _ in SERVICES:
+                hass.services.async_remove(DOMAIN, service_name)
 
     return is_unload
 
@@ -163,5 +173,9 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     :param entry: ConfigEntry: Config Entry object
     """
 
-    _updater: LuciUpdater = hass.data[DOMAIN][entry.entry_id][UPDATER]
-    await _updater.async_stop(clean_store=True)
+    runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if runtime and UPDATER in runtime:
+        await runtime[UPDATER].async_stop(clean_store=True)
+    else:
+        # HA normally unloads first, so the coordinator is already absent here.
+        await get_store(hass, get_config_value(entry, CONF_IP_ADDRESS)).async_remove()

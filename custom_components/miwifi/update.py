@@ -36,7 +36,8 @@ from .const import (
 )
 from .entity import MiWifiEntity
 from .enum import Model
-from .exceptions import LuciError
+from .exceptions import LuciError, LuciWriteUncertainError
+from .operations import manager_for
 from .updater import LuciUpdater, async_get_updater
 
 PARALLEL_UPDATES = 0
@@ -196,29 +197,43 @@ class MiWifiUpdate(MiWifiEntity, UpdateEntity):
         """Install firmware"""
 
         try:
-            await self._updater.luci.rom_upgrade(
-                {
-                    "url": self._update_data.get(ATTR_UPDATE_DOWNLOAD_URL),
-                    "filesize": self._update_data.get(ATTR_UPDATE_FILE_SIZE),
-                    "hash": self._update_data.get(ATTR_UPDATE_FILE_HASH),
-                    "needpermission": 1,
-                }
-            )
+            async with manager_for(self._updater).lock:
+                await self._updater.luci.rom_upgrade(
+                    {
+                        "url": self._update_data.get(ATTR_UPDATE_DOWNLOAD_URL),
+                        "filesize": self._update_data.get(ATTR_UPDATE_FILE_SIZE),
+                        "hash": self._update_data.get(ATTR_UPDATE_FILE_HASH),
+                        "needpermission": 1,
+                    }
+                )
+        except LuciWriteUncertainError:
+            pass  # Read-only verification below; never retry a firmware write.
         except LuciError as _e:
-            raise HomeAssistantError(str(_e)) from _e
+            raise HomeAssistantError("Router rejected the firmware upgrade") from _e
 
         try:
-            await self._updater.luci.flash_permission()
+            async with manager_for(self._updater).lock:
+                await self._updater.luci.flash_permission()
         except LuciError as _e:
             _LOGGER.debug("Clear permission error: %r", _e)
 
         await asyncio.sleep(FIRMWARE_UPDATE_WAIT)
 
         for _retry in range(1, FIRMWARE_UPDATE_RETRY):
-            if self._updater.data.get(ATTR_STATE, False):
-                break
-
+            try:
+                async with manager_for(self._updater).lock:
+                    response = await self._updater.luci.status()
+                actual = response.get("hardware", {}).get("version")
+                if actual:
+                    self._attr_installed_version = str(actual)
+                if actual == self._attr_latest_version:
+                    return
+            except LuciError:
+                pass
             await asyncio.sleep(1)
+        raise HomeAssistantError(
+            "Firmware version was not confirmed; installed version was not fabricated"
+        )
 
     async def async_install(
         self, version: str | None, backup: bool, **kwargs: Any
@@ -232,8 +247,6 @@ class MiWifiUpdate(MiWifiEntity, UpdateEntity):
 
         if action := getattr(self, f"_{self.entity_description.key}_install"):
             await action()
-
-            self._attr_installed_version = self._attr_latest_version
 
             self.async_write_ha_state()
 

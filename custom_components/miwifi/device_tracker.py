@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import logging
-import socket
+import asyncio
 import time
-from contextlib import closing
 from functools import cached_property
 from typing import Any, Final
 
@@ -18,7 +17,6 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import (
     AddEntitiesCallback,
-    EntityPlatform,
     async_get_current_platform,
 )
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -80,6 +78,11 @@ ATTR_CHANGES: Final = (
     "bound_name",
     "binding_source",
     "binding_ip_matches",
+    "operation_status",
+    "operation_id",
+    "pending",
+    ATTR_TRACKER_QOS_DOWN,
+    ATTR_TRACKER_QOS_UP,
 )
 
 OPTIMISTIC_ONLY_ATTRS: Final = (
@@ -105,6 +108,13 @@ async def async_setup_entry(
     """
 
     updater: LuciUpdater = async_get_updater(hass, config_entry.entry_id)
+    # Dispatcher callbacks do not run in the platform setup context.
+    platform = async_get_current_platform()
+    added_macs: set[str] = {
+        entity.mac_address.upper()
+        for entity in platform.entities.values()
+        if isinstance(entity, MiWifiDeviceTracker)
+    }
 
     @callback
     def add_device(new_device: dict) -> None:
@@ -123,28 +133,21 @@ async def async_setup_entry(
             ENTITY_ID_FORMAT, str(new_device.get(ATTR_TRACKER_MAC))
         )
 
-        try:
-            platform: EntityPlatform = async_get_current_platform()
-        except RuntimeError as _e:  # pragma: no cover
-            _LOGGER.debug("An error occurred while adding the device: %r", _e)
-
+        mac = str(new_device.get(ATTR_TRACKER_MAC, "")).upper()
+        if not mac or mac in added_macs:
             return
-
-        if entity_id in platform.entities:  # pragma: no cover
-            _LOGGER.debug("Device already added: %s", entity_id)
-
-            return
-
+        added_macs.add(mac)  # Also prevents duplicates before HA finishes adding.
         async_add_entities(
             [
                 MiWifiDeviceTracker(
-                    f"{DOMAIN}-{device.get(ATTR_TRACKER_MAC)}",
+                    f"{DOMAIN}-{new_device.get(ATTR_TRACKER_MAC)}",
                     entity_id,
                     new_device,
                     updater,
                     get_config_value(
                         config_entry, CONF_STAY_ONLINE, DEFAULT_STAY_ONLINE
                     ),
+                    on_remove=lambda: added_macs.discard(mac),
                 )
             ]
         )
@@ -173,6 +176,7 @@ class MiWifiDeviceTracker(ScannerEntity, CoordinatorEntity):
         device: dict,
         updater: LuciUpdater,
         stay_online: int,
+        on_remove=None,
     ) -> None:
         """Initialize device_tracker.
 
@@ -191,6 +195,7 @@ class MiWifiDeviceTracker(ScannerEntity, CoordinatorEntity):
         self._attr_name = device.get(ATTR_TRACKER_NAME, self.mac_address)
 
         self._stay_online: int = stay_online
+        self._on_tracker_removed = on_remove
 
         self.entity_id = entity_id
         self._attr_unique_id = unique_id
@@ -203,11 +208,18 @@ class MiWifiDeviceTracker(ScannerEntity, CoordinatorEntity):
         """When entity is added to hass."""
 
         await CoordinatorEntity.async_added_to_hass(self)
+        if self._on_tracker_removed is not None:
+            self.async_on_remove(self._on_tracker_removed)
 
-        self.hass.loop.call_later(
+        def start_check():
+            task = self.hass.async_create_task(self.check_ports())
+            self.async_on_remove(task.cancel)
+
+        timer = self.hass.loop.call_later(
             DEFAULT_CALL_DELAY,
-            lambda: self.hass.async_create_task(self.check_ports()),
+            start_check,
         )
+        self.async_on_remove(timer.cancel)
 
     @property
     def available(self) -> bool:
@@ -345,6 +357,9 @@ class MiWifiDeviceTracker(ScannerEntity, CoordinatorEntity):
             "binding_ip_matches": self._device.get("binding_ip_matches"),
             ATTR_TRACKER_QOS_DOWN: self._device.get(ATTR_TRACKER_QOS_DOWN, 0),
             ATTR_TRACKER_QOS_UP: self._device.get(ATTR_TRACKER_QOS_UP, 0),
+            "operation_status": self._device.get("operation_status"),
+            "operation_id": self._device.get("operation_id"),
+            "pending": self._device.get("pending", False),
         }
 
     @property
@@ -504,17 +519,27 @@ class MiWifiDeviceTracker(ScannerEntity, CoordinatorEntity):
     async def check_ports(self) -> None:
         """Scan port to configuration url"""
 
-        if self.ip_address is None:
+        if self.ip_address is None or not self.available or not self.is_connected:
             return
-
-        with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
-            sock.settimeout(5)
-
+        ip = self.ip_address
+        async with self._updater.port_scan_slots:
             for port in CONFIGURATION_PORTS:
-                result = sock.connect_ex((self.ip_address, port))
-                if result == 0:
+                writer = None
+                try:
+                    _, writer = await asyncio.wait_for(
+                        asyncio.open_connection(ip, port), timeout=1
+                    )
+                    if self.ip_address != ip or not self.is_connected:
+                        return
                     self._configuration_port = port
-
-                    _LOGGER.debug("Found open port %s: %s", self.ip_address, port)
-
+                    self._update_entry(self._device)
                     break
+                except (OSError, TimeoutError):
+                    continue
+                finally:
+                    if writer is not None:
+                        writer.close()
+                        try:
+                            await asyncio.wait_for(writer.wait_closed(), timeout=1)
+                        except (OSError, TimeoutError):
+                            pass
