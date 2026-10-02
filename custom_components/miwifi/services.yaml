@@ -30,7 +30,7 @@ request:
 
 set_mac_filter:
   name: Set MAC filter
-  description: Block or unblock a device by MAC address on the router.
+  description: Change one client's WAN permission, verify it by router readback, and return verified/changed. Does not block mobile internet or guarantee protection against alternate gateways.
   target:
     device:
       integration: miwifi
@@ -54,6 +54,20 @@ set_mac_filter:
               value: "0"
             - label: "Unblock"
               value: "1"
+
+get_client_status:
+  name: Read client status
+  description: Read one exact client's WAN permission, online status, current IP and DHCP reservation directly from the router. Does not change settings; fails if identity/permission cannot be verified.
+  target:
+    device:
+      integration: miwifi
+  fields:
+    mac:
+      name: MAC address
+      required: true
+      example: "02:12:34:56:78:90"
+      selector:
+        text:
 
 macbind_info:
   name: MAC bind info

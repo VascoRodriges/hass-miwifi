@@ -13,7 +13,7 @@ from homeassistant.const import (
     CONF_TIMEOUT,
     EVENT_HOMEASSISTANT_STOP,
 )
-from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, SupportsResponse
 from homeassistant.exceptions import PlatformNotReady
 
 from .const import (
@@ -113,7 +113,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     for service_name, service in SERVICES:
         if not hass.services.has_service(DOMAIN, service_name):
             hass.services.async_register(
-                DOMAIN, service_name, service(hass).async_call_service, service.schema
+                DOMAIN, service_name, service(hass).async_call_service, service.schema,
+                supports_response=SupportsResponse.OPTIONAL
+                if getattr(service, 'supports_response', False) else SupportsResponse.NONE,
             )
 
     return True

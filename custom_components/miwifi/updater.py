@@ -107,6 +107,7 @@ from .enum import (
 )
 from .exceptions import LuciConnectionError, LuciError, LuciRequestError
 from .luci import LuciClient
+from .client_identity import binding_snapshot, binding_attributes
 from .self_check import async_self_check
 
 PREPARE_METHODS: Final = (
@@ -846,7 +847,7 @@ class LuciUpdater(DataUpdateCoordinator):
             return
 
         qos_data = {}
-        macbind_macs: set[str] | None = None
+        bindings = None
         try:
             qos_response = await self.luci.qos_info()
 
@@ -871,16 +872,17 @@ class LuciUpdater(DataUpdateCoordinator):
 
         try:
             macbind_response = await self.luci.macbind_info()
-            macbind_macs = self._extract_macbind_macs(macbind_response)
-        except LuciError as _e:
+            bindings = binding_snapshot(macbind_response)
+        except (LuciError, ValueError) as _e:
             _LOGGER.debug("Failed to get macbind_info: %s", _e)
 
         for device in response["list"]:
             _device_mac = device.get(ATTR_TRACKER_MAC, device.get("mac", "")).upper()
             device["qos_down"] = qos_data.get(_device_mac, {}).get("qos_down", 0)
             device["qos_up"] = qos_data.get(_device_mac, {}).get("qos_up", 0)
-            if macbind_macs is not None:
-                device[ATTR_TRACKER_MAC_BOUND] = _device_mac in macbind_macs
+            current = device.get('ip', [])
+            current_ip = current[0].get('ip') if current and isinstance(current[0], dict) else None
+            device.update(binding_attributes(bindings, _device_mac, current_ip))
 
         integrations: dict[str, dict] = async_get_integrations(self.hass)
 
@@ -1195,7 +1197,11 @@ class LuciUpdater(DataUpdateCoordinator):
             and isinstance(device["authority"], dict)
             and "wan" in device["authority"]
             else None,
-            ATTR_TRACKER_MAC_BOUND: bool(device.get(ATTR_TRACKER_MAC_BOUND, False)),
+            ATTR_TRACKER_MAC_BOUND: device.get(ATTR_TRACKER_MAC_BOUND),
+            "bound_ip": device.get("bound_ip"),
+            "bound_name": device.get("bound_name"),
+            "binding_source": device.get("binding_source", "unknown"),
+            "binding_ip_matches": device.get("binding_ip_matches"),
             ATTR_TRACKER_QOS_DOWN: device.get(ATTR_TRACKER_QOS_DOWN, 0),
             ATTR_TRACKER_QOS_UP: device.get(ATTR_TRACKER_QOS_UP, 0),
         }
@@ -1311,13 +1317,11 @@ class LuciUpdater(DataUpdateCoordinator):
 
         del data
 
-        with contextlib.suppress(LuciError):
+        with contextlib.suppress(LuciError, ValueError):
             response: dict = await self.luci.macbind_info()
-
-            macbind_macs: set[str] = self._extract_macbind_macs(response)
-
+            bindings = binding_snapshot(response)
             for mac, device in self.devices.items():
-                device[ATTR_TRACKER_MAC_BOUND] = mac.upper() in macbind_macs
+                device.update(binding_attributes(bindings, mac, device.get(ATTR_TRACKER_IP)))
 
     @staticmethod
     def _extract_macbind_macs(response: dict) -> set[str]:
@@ -1325,7 +1329,8 @@ class LuciUpdater(DataUpdateCoordinator):
 
         The router returns bound clients in `list`. On some firmwares the current
         online clients in `devicelist` also expose the same state via `tag == 2`.
-        We merge both sources by MAC only and do not rely on IP equality because
+        The reservation list is authoritative; tag-only is a fallback when absent.
+        We do not rely on IP equality because
         a client may still be using an old DHCP lease while already present in the
         bound list with another IP.
 
@@ -1333,23 +1338,7 @@ class LuciUpdater(DataUpdateCoordinator):
         :return set[str]
         """
 
-        macbind_macs: set[str] = set()
-
-        for entry in response.get("list", []):
-            if isinstance(entry, dict) and entry.get("mac"):
-                macbind_macs.add(str(entry["mac"]).upper())
-            elif isinstance(entry, str) and entry:
-                macbind_macs.add(entry.upper())
-
-        for entry in response.get("devicelist", []):
-            if (
-                isinstance(entry, dict)
-                and entry.get("mac")
-                and int(entry.get("tag", 0)) == 2
-            ):
-                macbind_macs.add(str(entry["mac"]).upper())
-
-        return macbind_macs
+        return set(binding_snapshot(response))
 
     def _clean_devices(self) -> None:
         """Clean devices."""

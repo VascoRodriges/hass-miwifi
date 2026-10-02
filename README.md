@@ -219,7 +219,32 @@ Common additional endpoints used by entities and services:
 
 Availability depends on router model, region, operating mode, and firmware branch.
 
-## Credits
+### Verified client identity and service responses (4.0.1)
+
+Client trackers now distinguish `ip` (current/last observed address) from
+`bound_ip`/`bound_name` (DHCP reservation), with `binding_source` and
+`binding_ip_matches`. Failed reads produce unknown binding state, not "unbound".
+The explicit reservation list is authoritative; old firmware tag-only fallback
+does not invent a reserved address from a current lease.
+
+`get_client_status` reads one exact MAC's WAN permission, connection and addresses.
+`set_mac_filter`, `mac_bind`, `mac_unbind` and data-returning services support an
+optional HA response. Existing read events remain compatible. WAN and DHCP writes
+must be confirmed by router readback; invalid identity, occupied address, hidden
+timeouts or unconfirmed state are errors, not optimistic success. An already-correct
+WAN permission is not written again. DHCP changes also check unrelated reservations.
+
+These services are primitives, not an automatic Assist exposure policy. Protect
+infrastructure and use a closed allowlist in your own scripts. WAN permission does
+not prove internet connectivity and does not block cellular/alternate-gateway access.
+
+Portable tests (no hardware/network):
+
+```sh
+python -m unittest tests.test_client_identity
+```
+
+## Credits and upstream
 
 - Original integration architecture and router support matrix: Dmitry Mamontov
 - Upstream repository: [dmamontov/hass-miwifi](https://github.com/dmamontov/hass-miwifi)

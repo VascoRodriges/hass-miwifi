@@ -76,6 +76,10 @@ ATTR_CHANGES: Final = (
     ATTR_TRACKER_OPTIONAL_MAC,
     ATTR_TRACKER_WAN,
     ATTR_TRACKER_MAC_BOUND,
+    "bound_ip",
+    "bound_name",
+    "binding_source",
+    "binding_ip_matches",
 )
 
 OPTIMISTIC_ONLY_ATTRS: Final = (
@@ -334,7 +338,11 @@ class MiWifiDeviceTracker(ScannerEntity, CoordinatorEntity):
                 ATTR_TRACKER_LAST_ACTIVITY, None
             ),
             ATTR_TRACKER_WAN: self._device.get(ATTR_TRACKER_WAN, None),
-            ATTR_TRACKER_MAC_BOUND: self._device.get(ATTR_TRACKER_MAC_BOUND, False),
+            ATTR_TRACKER_MAC_BOUND: self._device.get(ATTR_TRACKER_MAC_BOUND),
+            "bound_ip": self._device.get("bound_ip"),
+            "bound_name": self._device.get("bound_name"),
+            "binding_source": self._device.get("binding_source", "unknown"),
+            "binding_ip_matches": self._device.get("binding_ip_matches"),
             ATTR_TRACKER_QOS_DOWN: self._device.get(ATTR_TRACKER_QOS_DOWN, 0),
             ATTR_TRACKER_QOS_UP: self._device.get(ATTR_TRACKER_QOS_UP, 0),
         }
