@@ -1,4 +1,4 @@
-name: Checks dev HASS
+name: Checks prerelease HASS
 
 on:
   push:
@@ -9,14 +9,13 @@ on:
     - cron: '0 */6 * * *'
 
 jobs:
-  py-lint-test:
+  py-compile-test:
     runs-on: "ubuntu-latest"
     steps:
-      - uses: actions/checkout@v2
-      - uses: dmamontov/hass-py-lint@main
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          hass-version: "dev"
-          path: "custom_components/miwifi tests"
-          use-pytest: true
-          extra-pylint-options: "--disable=unused-argument"
-          use-hass-branch: true
+          python-version: "3.14"
+      - run: pip install --pre homeassistant aiohttp_cors aiodiscover scapy async_upnp_client
+      - run: python -m compileall -q custom_components/miwifi
+      - run: python -m unittest tests.test_client_identity

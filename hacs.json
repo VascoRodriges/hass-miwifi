@@ -1,6 +1,5 @@
 {
   "name": "MiWiFi Controller",
   "render_readme": true,
-  "type": "integration",
   "homeassistant": "2023.3.0"
 }

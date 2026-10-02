@@ -1,17 +1,30 @@
 calc_passwd:
   name: Calculate passwd
   description: Calculate default passwd.
-  target:
-    device:
-      integration: miwifi
+  fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
 
 request:
   name: Send request
   description: Send request to router.
-  target:
-    device:
-      integration: miwifi
   fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
     uri:
       name: Uri
       description: Request uri.
@@ -31,10 +44,16 @@ request:
 set_mac_filter:
   name: Set MAC filter
   description: Change one client's WAN permission, verify it by router readback, and return verified/changed. Does not block mobile internet or guarantee protection against alternate gateways.
-  target:
-    device:
-      integration: miwifi
   fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
     mac:
       name: MAC address
       description: MAC address of the device to block or unblock.
@@ -58,10 +77,16 @@ set_mac_filter:
 get_client_status:
   name: Read client status
   description: Read one exact client's WAN permission, online status, current IP and DHCP reservation directly from the router. Does not change settings; fails if identity/permission cannot be verified.
-  target:
-    device:
-      integration: miwifi
   fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
     mac:
       name: MAC address
       required: true
@@ -72,17 +97,30 @@ get_client_status:
 macbind_info:
   name: MAC bind info
   description: Get the list of MAC-bound clients from the router.
-  target:
-    device:
-      integration: miwifi
+  fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
 
 mac_bind:
   name: Bind MAC
   description: Bind a client IP address to its MAC address.
-  target:
-    device:
-      integration: miwifi
   fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
     ip:
       name: IP address
       description: Client IP address to bind.
@@ -108,10 +146,16 @@ mac_bind:
 mac_unbind:
   name: Unbind MAC
   description: Remove an existing IP to MAC binding.
-  target:
-    device:
-      integration: miwifi
   fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
     mac:
       name: MAC address
       description: Client MAC address to unbind.
@@ -123,10 +167,16 @@ mac_unbind:
 cleanup_stale_clients:
   name: Cleanup stale clients
   description: Remove old router clients from the integration and Home Assistant registries.
-  target:
-    device:
-      integration: miwifi
   fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
     days:
       name: Days
       description: Override the stale age threshold in days. If omitted, the integration activity_days option is used.
@@ -141,17 +191,30 @@ cleanup_stale_clients:
 port_forward_list:
   name: Port forward list
   description: List all port forwarding rules on the router.
-  target:
-    device:
-      integration: miwifi
+  fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
 
 add_port_forward:
   name: Add port forward
   description: Add a port forwarding rule.
-  target:
-    device:
-      integration: miwifi
   fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
     name:
       name: Rule name
       description: Name of the port forwarding rule.
@@ -204,10 +267,16 @@ add_port_forward:
 delete_port_forward:
   name: Delete port forward
   description: Delete a port forwarding rule.
-  target:
-    device:
-      integration: miwifi
   fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
     proto:
       name: Protocol
       description: Protocol of the rule.
@@ -236,17 +305,30 @@ delete_port_forward:
 qos_info:
   name: QoS info
   description: Get QoS (bandwidth control) information.
-  target:
-    device:
-      integration: miwifi
+  fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
 
 set_qos:
   name: Set QoS
   description: Set per-device bandwidth limit.
-  target:
-    device:
-      integration: miwifi
   fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
     mac:
       name: MAC address
       description: MAC address of the device.
@@ -280,17 +362,30 @@ set_qos:
 wifi_timer_info:
   name: WiFi timer info
   description: Get WiFi timer (parental control) schedules.
-  target:
-    device:
-      integration: miwifi
+  fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
 
 set_wifi_timer:
   name: Set WiFi timer
   description: Set global WiFi transmitter schedule (turns WiFi on/off at specified times).
-  target:
-    device:
-      integration: miwifi
   fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
     start_time:
       name: Start time
       description: Time when WiFi turns OFF (HH:MM).
@@ -328,10 +423,16 @@ set_wifi_timer:
 set_mac_time:
   name: Set parental control
   description: Set per-device internet access schedule (parental control via misystem/set_mac_time).
-  target:
-    device:
-      integration: miwifi
   fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
     mac:
       name: MAC address
       description: MAC address of the device to restrict.
@@ -376,10 +477,16 @@ set_mac_time:
 add_mesh_node:
   name: Add mesh node
   description: Add a new mesh node to the network.
-  target:
-    device:
-      integration: miwifi
   fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
     locate_ip:
       name: Node IP
       description: IP address of the node to add to the mesh network.
@@ -391,10 +498,16 @@ add_mesh_node:
 set_wifi_macfilter:
   name: Set WiFi MAC filter
   description: Configure the WiFi MAC filter mode and list of controlled devices (xqnetwork/set_wifi_macfilter).
-  target:
-    device:
-      integration: miwifi
   fields:
+    device_id:
+      name: Router
+      description: Choose one MiWiFi router, not a tracked client device.
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: miwifi
+          multiple: true
     model:
       name: Filter mode
       description: "0 - disabled, 1 - blacklist (deny listed MACs), 2 - whitelist (allow only listed MACs)."
