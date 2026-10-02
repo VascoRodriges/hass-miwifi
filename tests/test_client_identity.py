@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-import voluptuous as vol
+import custom_components.miwifi.services as miwifi_services
 
 from custom_components.miwifi.client_identity import (
     binding_attributes,
@@ -176,7 +176,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         with patch(
             "custom_components.miwifi.services.asyncio.sleep", new_callable=AsyncMock
         ):
-            with self.assertRaises(vol.Invalid):
+            with self.assertRaises(miwifi_services.vol.Invalid):
                 await service.async_call_service(
                     SimpleNamespace(data={"mac": MAC, "wan": 0})
                 )
@@ -186,7 +186,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_identity_never_writes(self):
         service, updater = self.service(MiWifiSetMacFilterServiceCall)
         updater.luci.device_list.return_value = clients(mac=OTHER)
-        with self.assertRaises(vol.Invalid):
+        with self.assertRaises(miwifi_services.vol.Invalid):
             await service.async_call_service(
                 SimpleNamespace(data={"mac": MAC, "wan": 0})
             )
@@ -195,7 +195,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_collision_prevents_bind(self):
         service, updater = self.service(MiWifiMacBindServiceCall)
         updater.luci.macbind_info.return_value = reservations(mac=OTHER)
-        with self.assertRaises(vol.Invalid):
+        with self.assertRaises(miwifi_services.vol.Invalid):
             await service.async_call_service(
                 SimpleNamespace(data={"mac": MAC, "ip": IP, "name": "phone"})
             )
@@ -204,7 +204,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_bind_readback_required_and_no_optimistic_on_failure(self):
         service, updater = self.service(MiWifiMacBindServiceCall)
         updater.luci.macbind_info.return_value = reservations(ip="192.168.31.60")
-        with self.assertRaises(vol.Invalid):
+        with self.assertRaises(miwifi_services.vol.Invalid):
             await service.async_call_service(
                 SimpleNamespace(data={"mac": MAC, "ip": IP, "name": "phone"})
             )
@@ -214,7 +214,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_bind_timeout_is_error_not_silent_success(self):
         service, updater = self.service(MiWifiMacBindServiceCall)
         updater.luci.mac_bind.side_effect = LuciConnectionError("Connection error")
-        with self.assertRaises(vol.Invalid):
+        with self.assertRaises(miwifi_services.vol.Invalid):
             await service.async_call_service(
                 SimpleNamespace(data={"mac": MAC, "ip": IP, "name": "phone"})
             )
