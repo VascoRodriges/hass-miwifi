@@ -1,13 +1,20 @@
 # MiWiFi for Home Assistant
 
 ![hacs](https://img.shields.io/badge/HACS-Custom-orange.svg)
-![version](https://img.shields.io/github/v/release/VascoRodriges/hass-miwifi)
+![release](https://img.shields.io/github/v/release/VascoRodriges/hass-miwifi?label=published%20release)
+![main](https://img.shields.io/badge/main-4.0.2-blue)
+
+[Русская инструкция](README.ru.md) · [Installation](#installation) · [YAML examples](#yaml-examples) · [Limitations](#important-notes)
 
 This repository is a fork of the original [dmamontov/hass-miwifi](https://github.com/dmamontov/hass-miwifi) project created by Dmitry Mamontov.
 
 The goal of this fork is to keep the MiWiFi integration usable on recent Home Assistant releases while preserving support for Xiaomi and Redmi routers running original MiWiFi firmware, or original firmware with minimal patches.
 
-In addition to Home Assistant compatibility work, this fork includes service improvements, extended `device_tracker` attributes, and optimistic UI updates for selected router actions.
+Track network clients and manage supported router controls locally from Home Assistant.
+This fork adds explicit client identity, DHCP reservation information, read-back
+verification and optimistic state with rollback, so a requested value is not
+mistaken for an applied router setting. No cloud account, LLM or external proxy is
+required for router communication.
 
 ## Fork status
 
@@ -15,6 +22,8 @@ In addition to Home Assistant compatibility work, this fork includes service imp
 - Original author: Dmitry Mamontov
 - Integration domain: `miwifi`
 - Current manifest version in this repository: `4.0.2`
+- HACS minimum Home Assistant version: `2026.9.4`
+- Published releases can lag behind `main`; check the downloaded manifest version
 - Device communication model: local polling through the MiWiFi LuCI API
 
 ## Important notes
@@ -23,10 +32,13 @@ In addition to Home Assistant compatibility work, this fork includes service imp
 - Routers running heavily modified or third-party firmware may expose different endpoints or payloads, so some features may be unavailable.
 - Portable regression tests cover client identity and backend reconciliation. The legacy upstream pytest suite is not part of this fork's current CI coverage. Real hardware validation was performed only on **Xiaomi Router AX6000 (RA72)**; failure paths and destructive controls are tested with mocks, not by disrupting a live network.
 - Other Xiaomi and Redmi models may still work, especially if they were supported by the upstream project, but in this fork they should be treated as unverified until tested.
+- This is a custom integration, not a Home Assistant Core integration or a certified Quality Scale tier.
+- It provides entities and service actions, not a bundled Lovelace dashboard, client grouping card, natural-language agent, or automatic Assist exposure policy. Those are separate user configurations.
+- Blocking WAN access affects this router's permission only: it does not block cellular data, another gateway, or a changed/private MAC address.
 
 ## What this fork adds
 
-- Adaptation for recent Home Assistant core APIs and platform behavior.
+- Compatibility work and live read-only validation on Home Assistant `2026.9.4`.
 - An options checkbox to preview stale clients without deleting them. Explicit cleanup requires separate confirmation.
 - Abstraction layer for LuCI API calls through `api_map.py`, where endpoints, request methods, and parameter mappings are centralized.
 - Extended service set for router management and diagnostics.
@@ -49,17 +61,33 @@ The integration exposes the following platform types:
 ## Installation
 
 ### Via HACS (Recommended)
+
 Since this repository is currently a custom fork, you need to add it to HACS manually:
+
 1. Open HACS in your Home Assistant.
 2. Click the three dots in the top right corner and select **Custom repositories**.
 3. Add the URL of this repository: `https://github.com/VascoRodriges/hass-miwifi`
 4. Select **Integration** as the category and click **Add**.
 5. Find "MiWiFi" in HACS, click **Download**, and restart Home Assistant.
 
+**Version check:** at the time of this documentation update, the published release
+is `v4.0.0`, while the backend described here is `4.0.2` in `main`. HACS may download
+the older release. Do not assume adding this repository installs the latest branch
+changes. If the desired branch/version is not offered by HACS, use the manual
+installation below. No new release is implied by these instructions.
+
+Do not install this fork alongside upstream under the same `miwifi` domain.
+Back up your existing component and HA configuration before replacing it.
+
 ### Manual Installation
-1. Download the latest release from this repository.
+
+1. Download the desired release, or [the `main` archive](https://github.com/VascoRodriges/hass-miwifi/archive/refs/heads/main.zip) for the unreleased backend described here.
 2. Copy the `custom_components/miwifi` folder to your Home Assistant `config/custom_components` directory.
 3. Restart Home Assistant.
+
+Verify `config/custom_components/miwifi/manifest.json` reports the expected version.
+Upgrading Python files requires a **Home Assistant Core restart**; reloading only
+the integration entry is insufficient. No router reboot is needed for installation.
 
 ## Configuration
 
@@ -67,8 +95,8 @@ Add the integration from Home Assistant UI:
 
 1. Go to `Settings -> Devices & Services`.
 2. Add the `MiWiFi` integration.
-3. Enter the router IP address and admin password.
-4. Choose the password encryption algorithm if needed.
+3. Enter the router's LAN IP address and its **local router administrator password**, not your WiFi or Xiaomi account password.
+4. Leave the default `sha1` encryption unless your router requires `sha256`.
 5. Optionally tune device tracking and polling options.
 
 Available options in this fork include:
@@ -81,6 +109,16 @@ Available options in this fork include:
 - Cleanup preview checkbox (does not delete clients during options update)
 
 The Home Assistant UI configuration flow already existed upstream. The cleanup checkbox now previews candidates; removal is a separately confirmed service action.
+
+Defaults are client tracking enabled, a 30-second poll interval, a 20-second request
+timeout, zero extra stay-online delay, and a 30-day stale threshold. Start with
+these defaults; shortening polling aggressively increases router load. A stable
+router IP and LAN access to its administration API are prerequisites.
+
+Some configuration entities (guest WiFi, channels, transmit power, diagnostic
+sensors) are disabled by default or omitted when not detected. Enable supported
+entities in HA's entity settings if needed; do not infer capability from the service
+name alone. Start with `get_capabilities` and read-only checks before control actions.
 
 ## LuCI API abstraction
 
@@ -107,10 +145,18 @@ Useful attributes include:
 - `last_activity`
 - `wan`
 - `mac_bound`
+- `bound_ip`, `bound_name`, `binding_source`, `binding_ip_matches`
 - `qos_down`
 - `qos_up`
+- `operation_status`, `operation_id`, `pending` (when an operation is recorded)
 
 These attributes make it easier to build automations around client connectivity, WAN access state, MAC binding, and QoS limits.
+
+`ip` is the observed lease; `bound_ip` is the reservation. Changing a reservation
+does not renew the client lease immediately. A tracker `online` attribute is a
+connection-duration value, not a boolean; `get_client_status` returns a separate
+boolean/unknown `online` value. Tracking is polling-based, not a real-time packet
+monitor. Devices using private/randomized MACs may appear as new clients.
 
 ## Optimistic UI behavior
 
@@ -126,7 +172,9 @@ Optimistic updates are implemented for:
 - Router LED and WiFi/guest switches, WiFi channel and transmit power
 - Per-client QoS limits and global bandwidth
 
-Entity attributes include `operation_status`, `operation_id`, and `pending`.
+Controlled router entities and affected client trackers report `operation_status`,
+`operation_id`, and `pending`; a client tracker reports the latest recorded client operation.
+These fields are not a persistent job queue or an operation history.
 States are `pending`, `confirmed`, `failed` (fresh actual value differs), and
 `unknown` (read-back unavailable). Failure restores the actual state, or the last
 confirmed state marked unknown. Unknown router controls are unavailable until a
@@ -140,7 +188,7 @@ The integration currently registers the following services:
 
 | Service | Purpose |
 |---|---|
-| `calc_passwd` | Calculate the default MiWiFi password hash for supported routers |
+| `calc_passwd` | Derive a firmware-default router password on supported routers; sensitive output |
 | `request` | Send an allowlisted read-only LuCI request and publish the response as an event; changes must use dedicated controls |
 | `get_client_status` | Read one exact client's authoritative current state |
 | `get_capabilities` | Probe read support without changing settings |
@@ -176,6 +224,87 @@ ID; existing one-element `device_id` lists remain compatible. Cleanup protects
 online clients, DHCP reservations, and devices belonging to other integrations.
 There is no automatic registry deletion on ageing or options save.
 
+`set_qos` requires a readable matching client row in `qos_info`; a missing row is
+not treated as an unlimited setting. When QoS is disabled or the firmware omits
+client limits, the action fails before writing. `set_band` uses global Mbps fields;
+`set_qos` uses the per-client KB/s fields exposed by this integration. Keep them
+distinct and verify your firmware's returned values before relying on limits.
+
+## YAML examples
+
+Replace `ROUTER_DEVICE_ID` with the **router's HA device ID**, not its entity ID or IP.
+The MAC below is synthetic; replace it with the selected client's stable MAC.
+These examples are HA script sequences. Read actions support `response_variable`;
+it is not supported by every control action.
+
+### Read capabilities and one client's status (no setting changes)
+
+```yaml
+sequence:
+  - action: miwifi.get_capabilities
+    data:
+      device_id: ROUTER_DEVICE_ID
+    response_variable: router_capabilities
+  - action: miwifi.get_client_status
+    data:
+      device_id: ROUTER_DEVICE_ID
+      mac: "02:12:34:56:78:90"
+    response_variable: client_status
+```
+
+### Block or restore WAN access (changes router permission)
+
+Use only after verifying the exact client identity and excluding infrastructure.
+`wan: 0` blocks; `wan: 1` restores access. Success means the router's WAN authority
+was read back, not that internet reachability was tested.
+
+```yaml
+sequence:
+  - action: miwifi.set_mac_filter
+    data:
+      device_id: ROUTER_DEVICE_ID
+      mac: "02:12:34:56:78:90"
+      wan: 0
+    response_variable: result
+```
+
+### Preview stale-client cleanup (does not delete anything)
+
+```yaml
+sequence:
+  - action: miwifi.cleanup_stale_clients
+    data:
+      device_id: ROUTER_DEVICE_ID
+      days: 30
+      dry_run: true
+    response_variable: preview
+```
+
+Review `preview.candidates` first. Actual deletion requires a separate call with
+`dry_run: false` **and** `confirm: true`. It removes eligible integration/HA registry
+records, not clients or DHCP reservations from the router. Back up HA first.
+
+## Troubleshooting and safe voice integration
+
+- **Login fails:** check LAN reachability, the local admin password, and the router's
+  required hash algorithm. A successful ping alone does not prove the LuCI API works.
+- **Action fails or state is unknown:** read the router state again. Do not loop a
+  write on a timeout: the router may have applied it even when its reply was lost.
+- **Schedule unavailable:** use `get_capabilities`; endpoint availability depends on
+  firmware. On the validated AX6000 RA72 setup the WiFi schedule read probe fails.
+- **Device appears twice or changes identity:** check private/randomized MAC settings;
+  a DHCP reservation identifies a MAC, not a person's name or a phone model.
+- **HA reports a deprecated device-registry API:** HA 2026.9.4 can warn about
+  `async_get_device`; migration is needed before its announced removal in 2027.8.
+  This version does not claim compatibility with that future release.
+
+For Assist, expose narrow, separately configured scripts with an explicit client
+allowlist. Resolve friendly names to confirmed MACs, protect the router, HA host
+and other infrastructure, and require confirmation for disruptive operations.
+Do not expose raw API requests, router-wide filters, firmware updates or cleanup
+as unrestricted LLM tools. No household-specific names, ranges or allowlists are
+shipped in this integration.
+
 ## Events
 
 The integration fires the `miwifi_luci` event for data-returning or raw-request services.
@@ -189,6 +318,9 @@ This is useful for automations that need access to the raw router response, for 
 - `wifi_timer_info`
 
 The event payload includes the target device id, request URI, request body, and router response.
+Raw service responses/events may contain client names, IPs, MACs or other private
+router data. Diagnostic-download redaction does not sanitize these runtime events;
+do not publish them unreviewed in issue reports or logs.
 
 ## Router compatibility
 
@@ -238,7 +370,10 @@ Common additional endpoints used by entities and services:
 - `xqnetwork/add_redirect`
 - `xqnetwork/delete_redirect`
 - `misystem/qos_info`
-- `misystem/set_qos`
+- `misystem/qos_switch`
+- `misystem/qos_mode`
+- `misystem/set_band`
+- `misystem/qos_limits`
 - `xqnetwork/wifi_timer`
 - `xqnetwork/set_wifi_timer`
 - `misystem/set_mac_time`
@@ -257,7 +392,7 @@ does not invent a reserved address from a current lease.
 `get_client_status` reads one exact MAC's WAN permission, connection and addresses.
 `set_mac_filter`, `mac_bind`, `mac_unbind` and data-returning services support an
 optional HA response. Existing read events remain compatible. WAN and DHCP writes
-must be confirmed by router readback; invalid identity, occupied address, hidden
+must be confirmed by router readback; invalid identity, an occupied address or
 unconfirmed state is an error, not optimistic success. Lost responses can recover
 only when fresh read-back proves the requested state. An already-correct
 WAN permission is not written again. DHCP changes also check unrelated reservations.
@@ -269,8 +404,15 @@ not prove internet connectivity and does not block cellular/alternate-gateway ac
 Portable tests (no hardware/network):
 
 ```sh
-python -m unittest tests.test_client_identity tests.test_backend_safety
+python -m unittest tests.test_client_identity tests.test_backend_safety tests.test_documentation
 ```
+
+The backend/client regression suite currently contains 66 tests. CI targets HA
+`2026.9.4` on Python `3.14`; local regression tests also ran on HA `2026.7.4`.
+This does not establish full-install compatibility with older HA versions.
+Real-device acceptance was read-only; failure, rollback and disruptive controls
+were tested with mocks. For bug reports include HA/integration version, router
+model/firmware and a sanitized error. Never attach credentials or raw private API data.
 
 ### Backend safety changes (4.0.2)
 
